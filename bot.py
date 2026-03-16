@@ -74,7 +74,92 @@ def detect_project(text: str) -> str | None:
     return None
 
 
-async def run_claude(prompt: str, cwd: str, session_id: str | None = None) -> tuple[str, str | None]:
+async def _read_stderr_lines(stream) -> list[str]:
+    """Read all stderr lines from a process stream."""
+    lines = []
+    while True:
+        line = await stream.readline()
+        if not line:
+            break
+        lines.append(line.decode("utf-8", errors="replace").rstrip())
+    return lines
+
+
+async def _run_claude_proc(cmd: list[str], cwd: str, status_msg=None) -> tuple[str, bytes]:
+    """Run a claude subprocess, optionally updating a Discord status message with progress."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stderr_lines: list[str] = []
+    last_update = 0.0
+    UPDATE_INTERVAL = 3.0  # update Discord message every 3 seconds
+
+    async def read_stderr():
+        nonlocal last_update
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if not text:
+                continue
+            stderr_lines.append(text)
+            print(f"[CLAUDE] {text}", flush=True)
+
+            # Update Discord status message periodically
+            if status_msg:
+                now = time.monotonic()
+                if now - last_update >= UPDATE_INTERVAL:
+                    last_update = now
+                    # Show latest meaningful status
+                    display = _format_progress(stderr_lines)
+                    try:
+                        await status_msg.edit(content=display)
+                    except Exception:
+                        pass
+
+    # Read stderr in background while waiting for stdout
+    stderr_task = asyncio.create_task(read_stderr())
+    stdout = await proc.stdout.read()
+    await stderr_task
+    await proc.wait()
+
+    return stdout.decode("utf-8", errors="replace").strip(), "\n".join(stderr_lines)
+
+
+def _format_progress(stderr_lines: list[str]) -> str:
+    """Format stderr lines into a Discord progress message."""
+    # Look for tool use patterns in stderr
+    tools_used = []
+    current_action = ""
+    for line in stderr_lines:
+        lower = line.lower()
+        if "tool" in lower or "read" in lower or "write" in lower or "edit" in lower:
+            # Extract tool name if possible
+            tools_used.append(line[:80])
+            current_action = line[:80]
+        elif "thinking" in lower or "searching" in lower or "analyzing" in lower:
+            current_action = line[:80]
+
+    status = "⏳ 處理中"
+    if current_action:
+        # Truncate for Discord
+        status += f"\n```\n{current_action[-200:]}\n```"
+    elif tools_used:
+        status += f" ({len(tools_used)} tool calls)"
+
+    elapsed = len(stderr_lines)
+    if elapsed > 0:
+        status += f"\n📝 {elapsed} steps"
+
+    return status
+
+
+async def run_claude(prompt: str, cwd: str, session_id: str | None = None, status_msg=None) -> tuple[str, str | None]:
     """Run claude CLI with the given prompt in the specified directory."""
     cmd = [
         "claude",
@@ -86,34 +171,18 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None) -> tu
     if session_id:
         cmd.extend(["--resume", session_id])
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    raw = stdout.decode("utf-8", errors="replace").strip()
+    raw, stderr_text = await _run_claude_proc(cmd, cwd, status_msg)
 
     # If resume failed (session not found), retry without --resume
-    if session_id and proc.returncode != 0:
-        stderr_text = stderr.decode("utf-8", errors="replace")
-        if "No conversation found" in stderr_text:
-            cmd_retry = [
-                "claude",
-                "-p", prompt,
-                "--system-prompt", SYSTEM_PROMPT,
-                "--output-format", "json",
-                "--verbose",
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd_retry,
-                cwd=cwd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            raw = stdout.decode("utf-8", errors="replace").strip()
+    if session_id and not raw and "No conversation found" in stderr_text:
+        cmd_retry = [
+            "claude",
+            "-p", prompt,
+            "--system-prompt", SYSTEM_PROMPT,
+            "--output-format", "json",
+            "--verbose",
+        ]
+        raw, stderr_text = await _run_claude_proc(cmd_retry, cwd, status_msg)
 
     new_session_id = None
     try:
@@ -160,10 +229,8 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None) -> tu
         result = raw
 
     if not result:
-        if stderr:
-            err_text = stderr.decode("utf-8", errors="replace").strip()
-            if err_text:
-                result = f"(stderr: {err_text[:500]})"
+        if stderr_text:
+            result = f"(stderr: {stderr_text[:500]})"
 
     return result or "(no output)", new_session_id
 
@@ -540,7 +607,7 @@ async def on_message(message: discord.Message):
     thinking = await message.reply("⏳ 處理中...")
 
     try:
-        result, new_session_id = await run_claude(prompt, cwd, session_id)
+        result, new_session_id = await run_claude(prompt, cwd, session_id, status_msg=thinking)
         if new_session_id:
             channel_session[message.channel.id] = new_session_id
 
