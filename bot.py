@@ -246,7 +246,7 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple
         stderr=asyncio.subprocess.PIPE,
     )
 
-    # stream-json: structured events go to stderr, stdout is empty
+    # stream-json: structured events go to stdout
     result_text = ""
     session_id = None
     tools_used: list[str] = []
@@ -276,7 +276,7 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple
     async def read_events():
         nonlocal result_text, session_id
         while True:
-            line = await proc.stderr.readline()
+            line = await proc.stdout.readline()
             if not line:
                 break
             text = line.decode("utf-8", errors="replace").rstrip()
@@ -314,10 +314,10 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple
                 turns = event.get("num_turns", 0)
                 print(f"[CLAUDE] done: {turns} turns, ${cost:.4f}", flush=True)
 
-    # Read events from stderr; stdout should be empty for stream-json
-    stderr_task = asyncio.create_task(read_events())
-    await proc.stdout.read()  # drain stdout
-    await stderr_task
+    # Read events from stdout; drain stderr
+    events_task = asyncio.create_task(read_events())
+    await proc.stderr.read()  # drain stderr
+    await events_task
     await proc.wait()
 
     return result_text, session_id
