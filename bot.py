@@ -32,8 +32,35 @@ MONITOR_SYSTEM_PROMPT = (
 )
 
 # Per-channel working directory and session
-channel_workdir: dict[int, str] = {}
-channel_session: dict[int, str | None] = {}
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+
+
+def _load_state():
+    """Load persisted channel state from disk."""
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        # JSON keys are strings, convert back to int
+        workdir = {int(k): v for k, v in data.get("workdir", {}).items()}
+        session = {int(k): v for k, v in data.get("session", {}).items()}
+        threads = set(int(t) for t in data.get("threads", []))
+        return workdir, session, threads
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
+        return {}, {}, set()
+
+
+def _save_state():
+    """Persist channel state to disk."""
+    data = {
+        "workdir": {str(k): v for k, v in channel_workdir.items()},
+        "session": {str(k): v for k, v in channel_session.items()},
+        "threads": list(bot_threads),
+    }
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f)
+
+
+channel_workdir, channel_session, _loaded_threads = _load_state()
 
 # Monitor state
 monitor_task: asyncio.Task | None = None
@@ -350,6 +377,7 @@ async def monitor_loop(channel: discord.TextChannel):
                     thread = await alert_msg.create_thread(name=f"Erigon 異常 - {time.strftime('%m/%d %H:%M')}")
                     bot_threads.add(thread.id)
                     channel_workdir[thread.id] = WORK_ROOT
+                    _save_state()
                     chunks = split_message(summary)
                     for chunk in chunks:
                         await thread.send(chunk)
@@ -415,7 +443,7 @@ def parse_prompt(content: str, bot_id: int) -> str | None:
 
 
 # Track threads created by the bot (thread_id -> True)
-bot_threads: set[int] = set()
+bot_threads: set[int] = _loaded_threads
 
 HELP_TEXT = """**Claude Bot 指令說明**
 
@@ -492,12 +520,14 @@ async def on_message(message: discord.Message):
             return
         channel_workdir[message.channel.id] = path
         channel_session[message.channel.id] = None
+        _save_state()
         await message.reply(f"✅ 工作目錄：`{path}`")
         return
 
     # !reset
     if content == "!reset":
         channel_session[message.channel.id] = None
+        _save_state()
         await message.reply("✅ 對話已重置")
         return
 
@@ -514,6 +544,7 @@ async def on_message(message: discord.Message):
                 await thread.send(f"🧵 Thread 已建立，已帶入之前的對話上下文！直接打字繼續聊。\n工作目錄：`{channel_workdir[thread.id]}`")
             else:
                 await thread.send(f"🧵 Thread 已建立！直接在這裡打字就能跟我對話。\n工作目錄：`{channel_workdir[thread.id]}`")
+            _save_state()
         except Exception as e:
             await message.reply(f"❌ 無法建立 thread: {e}")
         return
@@ -586,6 +617,7 @@ async def on_message(message: discord.Message):
                 await thread.send(f"🧵 Thread 已建立，已帶入之前的對話上下文！直接打字繼續聊。\n工作目錄：`{channel_workdir[thread.id]}`")
             else:
                 await thread.send(f"🧵 Thread 已建立！直接在這裡打字就能跟我對話。\n工作目錄：`{channel_workdir[thread.id]}`")
+            _save_state()
         except Exception as e:
             await message.reply(f"❌ 無法建立 thread: {e}")
         return
@@ -600,6 +632,7 @@ async def on_message(message: discord.Message):
             # Only reset session when actually switching to a different project
             if old_cwd is not None:
                 channel_session[message.channel.id] = None
+            _save_state()
 
     cwd = channel_workdir.get(message.channel.id, WORK_ROOT)
     session_id = channel_session.get(message.channel.id)
@@ -610,6 +643,7 @@ async def on_message(message: discord.Message):
         result, new_session_id = await run_claude(prompt, cwd, session_id, status_msg=thinking)
         if new_session_id:
             channel_session[message.channel.id] = new_session_id
+            _save_state()
 
         # Prepend project info if auto-detected
         if detected:

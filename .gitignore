@@ -2,3 +2,4 @@ bot.log
 *.log
 __pycache__/
 .env
+state.json
