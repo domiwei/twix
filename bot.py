@@ -5,6 +5,7 @@ import json
 import re
 import subprocess
 import time
+import shutil
 
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 WORK_ROOT = "/root/work"
@@ -44,9 +45,10 @@ def _load_state():
         workdir = {int(k): v for k, v in data.get("workdir", {}).items()}
         session = {int(k): v for k, v in data.get("session", {}).items()}
         threads = set(int(t) for t in data.get("threads", []))
-        return workdir, session, threads
+        worktrees = {int(k): v for k, v in data.get("worktrees", {}).items()}
+        return workdir, session, threads, worktrees
     except (FileNotFoundError, json.JSONDecodeError, TypeError):
-        return {}, {}, set()
+        return {}, {}, set(), {}
 
 
 def _save_state():
@@ -55,12 +57,13 @@ def _save_state():
         "workdir": {str(k): v for k, v in channel_workdir.items()},
         "session": {str(k): v for k, v in channel_session.items()},
         "threads": list(bot_threads),
+        "worktrees": {str(k): v for k, v in channel_worktrees.items()},
     }
     with open(STATE_FILE, "w") as f:
         json.dump(data, f)
 
 
-channel_workdir, channel_session, _loaded_threads = _load_state()
+channel_workdir, channel_session, _loaded_threads, channel_worktrees = _load_state()
 
 # Monitor state
 monitor_task: asyncio.Task | None = None
@@ -85,10 +88,67 @@ THREAD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Pattern: detect branch/task creation requests
+# e.g. "幫我在 erigon 開 branch fix/issue-42 修復 memory leak"
+#      "開個 branch feat/api 在 erigon 做新 API"
+#      "create branch fix/bug on erigon"
+BRANCH_PATTERN = re.compile(
+    r"(開|開個|建|建立|create|open|start)\s*.{0,5}branch",
+    re.IGNORECASE,
+)
+# Extract branch name: word containing "/"
+BRANCH_NAME_RE = re.compile(r"\b([a-zA-Z0-9_-]+/[a-zA-Z0-9_.#-]+)\b")
+
+# Pattern: task done
+DONE_PATTERN = re.compile(
+    r"(做完了|完成了|done|結束|收工|finished|close\s*task|關閉\s*task|任務完成|task\s*done)",
+    re.IGNORECASE,
+)
+
+# Pattern: list tasks
+TASK_LIST_PATTERN = re.compile(
+    r"(哪些|列出|list|查看|看看).{0,10}(task|任務|worktree|工作)",
+    re.IGNORECASE,
+)
+
 
 def wants_thread(text: str) -> bool:
     """Detect if user wants to start a thread via natural language."""
-    return bool(THREAD_PATTERN.search(text))
+    return bool(THREAD_PATTERN.search(text)) and not wants_branch_task(text)
+
+
+def wants_branch_task(text: str) -> bool:
+    """Detect if user wants to create a branch/worktree task."""
+    return bool(BRANCH_PATTERN.search(text)) and bool(BRANCH_NAME_RE.search(text))
+
+
+def parse_branch_task(text: str) -> tuple[str | None, str | None, str]:
+    """Extract (project, branch, description) from natural language."""
+    branch_match = BRANCH_NAME_RE.search(text)
+    branch = branch_match.group(1) if branch_match else None
+    project = detect_project(text)
+    # Description: remove the branch name and project from text, use the rest
+    desc = text
+    if branch:
+        desc = desc.replace(branch, "").strip()
+    if project:
+        desc = desc.replace(project, "").strip()
+    # Clean up common filler words
+    desc = re.sub(r"(開個?|建立?|create|open|start|幫我|在|的|上|做|個|on)\s*branch\s*", "", desc, flags=re.IGNORECASE).strip()
+    desc = re.sub(r"\b(on|in)\b", "", desc, flags=re.IGNORECASE).strip()
+    desc = re.sub(r"^[\s,，、在的上幫我開做個]+", "", desc).strip()
+    desc = re.sub(r"[\s,，、在的上]+$", "", desc).strip()
+    return project, branch, desc or (branch or "task")
+
+
+def wants_done(text: str) -> bool:
+    """Detect if user says the task is done."""
+    return bool(DONE_PATTERN.search(text))
+
+
+def wants_task_list(text: str) -> bool:
+    """Detect if user wants to see active tasks."""
+    return bool(TASK_LIST_PATTERN.search(text))
 
 
 def detect_project(text: str) -> str | None:
@@ -101,19 +161,84 @@ def detect_project(text: str) -> str | None:
     return None
 
 
-async def _read_stderr_lines(stream) -> list[str]:
-    """Read all stderr lines from a process stream."""
-    lines = []
-    while True:
-        line = await stream.readline()
-        if not line:
-            break
-        lines.append(line.decode("utf-8", errors="replace").rstrip())
-    return lines
+async def create_worktree(repo_path: str, branch_name: str) -> str:
+    """Create a git worktree for parallel work. Returns the worktree path."""
+    # Sanitize branch name for use as directory name
+    dir_suffix = branch_name.replace("/", "-")
+    repo_basename = os.path.basename(repo_path)
+    worktree_path = os.path.join(WORK_ROOT, f"{repo_basename}-wt-{dir_suffix}")
+
+    # Remove stale directory if it exists but isn't a valid worktree
+    if os.path.exists(worktree_path):
+        shutil.rmtree(worktree_path)
+
+    proc = await asyncio.create_subprocess_exec(
+        "git", "worktree", "add", "-b", branch_name, worktree_path,
+        cwd=repo_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        # Branch might already exist, try without -b
+        proc2 = await asyncio.create_subprocess_exec(
+            "git", "worktree", "add", worktree_path, branch_name,
+            cwd=repo_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr2 = await proc2.communicate()
+        if proc2.returncode != 0:
+            raise RuntimeError(stderr.decode() + "\n" + stderr2.decode())
+
+    return worktree_path
 
 
-async def _run_claude_proc(cmd: list[str], cwd: str, status_msg=None) -> tuple[str, bytes]:
-    """Run a claude subprocess, optionally updating a Discord status message with progress."""
+async def remove_worktree(repo_path: str, worktree_path: str):
+    """Remove a git worktree."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "worktree", "remove", "--force", worktree_path,
+        cwd=repo_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.wait()
+    # Clean up directory if still present
+    if os.path.exists(worktree_path):
+        shutil.rmtree(worktree_path)
+
+
+def _format_tool_desc(name: str, input_data: dict) -> str:
+    """Format a tool use into a short human-readable description."""
+    if name == "Read":
+        path = input_data.get("file_path", "")
+        return f"📖 讀取 `{os.path.basename(path)}`"
+    elif name == "Edit":
+        path = input_data.get("file_path", "")
+        return f"✏️ 編輯 `{os.path.basename(path)}`"
+    elif name == "Write":
+        path = input_data.get("file_path", "")
+        return f"📝 寫入 `{os.path.basename(path)}`"
+    elif name == "Bash":
+        cmd = input_data.get("command", "")
+        return f"💻 `{cmd[:60]}`"
+    elif name == "Grep":
+        pattern = input_data.get("pattern", "")
+        return f"🔍 搜尋 `{pattern[:40]}`"
+    elif name == "Glob":
+        pattern = input_data.get("pattern", "")
+        return f"📁 找檔案 `{pattern[:40]}`"
+    elif name in ("WebSearch", "WebFetch"):
+        return f"🌐 {name}"
+    elif name == "Agent":
+        desc = input_data.get("description", "")
+        return f"🤖 子任務：{desc[:40]}"
+    else:
+        return f"🔧 {name}"
+
+
+async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple[str, str | None]:
+    """Run claude with stream-json, parse events for progress, return (result, session_id)."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -121,12 +246,35 @@ async def _run_claude_proc(cmd: list[str], cwd: str, status_msg=None) -> tuple[s
         stderr=asyncio.subprocess.PIPE,
     )
 
-    stderr_lines: list[str] = []
+    # stream-json: structured events go to stderr, stdout is empty
+    result_text = ""
+    session_id = None
+    tools_used: list[str] = []
+    current_status = "🤔 思考中..."
     last_update = 0.0
-    UPDATE_INTERVAL = 3.0  # update Discord message every 3 seconds
+    UPDATE_INTERVAL = 2.0
 
-    async def read_stderr():
-        nonlocal last_update
+    async def update_status(new_status: str):
+        nonlocal last_update, current_status
+        current_status = new_status
+        if not status_msg:
+            return
+        now = time.monotonic()
+        if now - last_update >= UPDATE_INTERVAL:
+            last_update = now
+            display = current_status
+            if tools_used:
+                display += f"\n\n📊 已執行 {len(tools_used)} 個步驟"
+                # Show last 3 tools
+                recent = tools_used[-3:]
+                display += "\n" + "\n".join(f"  {t}" for t in recent)
+            try:
+                await status_msg.edit(content=display)
+            except Exception:
+                pass
+
+    async def read_events():
+        nonlocal result_text, session_id
         while True:
             line = await proc.stderr.readline()
             if not line:
@@ -134,56 +282,45 @@ async def _run_claude_proc(cmd: list[str], cwd: str, status_msg=None) -> tuple[s
             text = line.decode("utf-8", errors="replace").rstrip()
             if not text:
                 continue
-            stderr_lines.append(text)
-            print(f"[CLAUDE] {text}", flush=True)
 
-            # Update Discord status message periodically
-            if status_msg:
-                now = time.monotonic()
-                if now - last_update >= UPDATE_INTERVAL:
-                    last_update = now
-                    # Show latest meaningful status
-                    display = _format_progress(stderr_lines)
-                    try:
-                        await status_msg.edit(content=display)
-                    except Exception:
-                        pass
+            try:
+                event = json.loads(text)
+            except json.JSONDecodeError:
+                print(f"[CLAUDE] {text}", flush=True)
+                continue
 
-    # Read stderr in background while waiting for stdout
-    stderr_task = asyncio.create_task(read_stderr())
-    stdout = await proc.stdout.read()
+            etype = event.get("type", "")
+
+            if etype == "assistant":
+                msg = event.get("message", {})
+                for block in msg.get("content", []):
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_use":
+                        name = block.get("name", "")
+                        inp = block.get("input", {})
+                        desc = _format_tool_desc(name, inp)
+                        tools_used.append(desc)
+                        print(f"[CLAUDE] tool: {desc}", flush=True)
+                        await update_status(f"⏳ {desc}")
+                    elif block.get("type") == "text" and block.get("text"):
+                        # Claude is generating text
+                        await update_status("💬 撰寫回覆中...")
+
+            elif etype == "result":
+                result_text = event.get("result", "")
+                session_id = event.get("session_id")
+                cost = event.get("total_cost_usd", 0)
+                turns = event.get("num_turns", 0)
+                print(f"[CLAUDE] done: {turns} turns, ${cost:.4f}", flush=True)
+
+    # Read events from stderr; stdout should be empty for stream-json
+    stderr_task = asyncio.create_task(read_events())
+    await proc.stdout.read()  # drain stdout
     await stderr_task
     await proc.wait()
 
-    return stdout.decode("utf-8", errors="replace").strip(), "\n".join(stderr_lines)
-
-
-def _format_progress(stderr_lines: list[str]) -> str:
-    """Format stderr lines into a Discord progress message."""
-    # Look for tool use patterns in stderr
-    tools_used = []
-    current_action = ""
-    for line in stderr_lines:
-        lower = line.lower()
-        if "tool" in lower or "read" in lower or "write" in lower or "edit" in lower:
-            # Extract tool name if possible
-            tools_used.append(line[:80])
-            current_action = line[:80]
-        elif "thinking" in lower or "searching" in lower or "analyzing" in lower:
-            current_action = line[:80]
-
-    status = "⏳ 處理中"
-    if current_action:
-        # Truncate for Discord
-        status += f"\n```\n{current_action[-200:]}\n```"
-    elif tools_used:
-        status += f" ({len(tools_used)} tool calls)"
-
-    elapsed = len(stderr_lines)
-    if elapsed > 0:
-        status += f"\n📝 {elapsed} steps"
-
-    return status
+    return result_text, session_id
 
 
 async def fetch_thread_history(channel, limit: int = 20) -> str:
@@ -201,16 +338,16 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None, statu
         "claude",
         "-p", prompt,
         "--system-prompt", SYSTEM_PROMPT,
-        "--output-format", "json",
+        "--output-format", "stream-json",
         "--verbose",
     ]
     if session_id:
         cmd.extend(["--resume", session_id])
 
-    raw, stderr_text = await _run_claude_proc(cmd, cwd, status_msg)
+    result, new_session_id = await _run_claude_stream(cmd, cwd, status_msg)
 
-    # If resume failed (session not found), rebuild context from thread history
-    if session_id and not raw or (session_id and "No conversation found" in stderr_text):
+    # If resume failed (empty result), rebuild context from thread history
+    if session_id and not result:
         context = ""
         if channel:
             try:
@@ -227,58 +364,10 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None, statu
             "claude",
             "-p", rebuilt_prompt,
             "--system-prompt", SYSTEM_PROMPT,
-            "--output-format", "json",
+            "--output-format", "stream-json",
             "--verbose",
         ]
-        raw, stderr_text = await _run_claude_proc(cmd_retry, cwd, status_msg)
-
-    new_session_id = None
-    try:
-        data = json.loads(raw)
-        if isinstance(data, list):
-            # Find the result entry
-            result = ""
-            for entry in data:
-                if not isinstance(entry, dict):
-                    continue
-                if entry.get("type") == "result":
-                    result = entry.get("result", "")
-                    new_session_id = entry.get("session_id")
-            # If result is empty, collect tool outputs and assistant text
-            if not result:
-                parts = []
-                for entry in data:
-                    if not isinstance(entry, dict):
-                        continue
-                    # Assistant text messages
-                    if entry.get("type") == "assistant" and entry.get("message"):
-                        msg = entry["message"]
-                        for block in msg.get("content", []):
-                            if not isinstance(block, dict):
-                                continue
-                            if block.get("type") == "text" and block.get("text"):
-                                parts.append(block["text"])
-                    # Tool results
-                    if entry.get("type") == "tool_result":
-                        content = entry.get("content", "")
-                        if isinstance(content, str) and content:
-                            parts.append(content)
-                        elif isinstance(content, list):
-                            for item in content:
-                                if isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
-                                    parts.append(item["text"])
-                result = "\n".join(parts) if parts else raw
-        elif isinstance(data, dict):
-            result = data.get("result", raw)
-            new_session_id = data.get("session_id")
-        else:
-            result = raw
-    except (json.JSONDecodeError, TypeError):
-        result = raw
-
-    if not result:
-        if stderr_text:
-            result = f"(stderr: {stderr_text[:500]})"
+        result, new_session_id = await _run_claude_stream(cmd_retry, cwd, status_msg)
 
     return result or "(no output)", new_session_id
 
@@ -484,6 +573,12 @@ HELP_TEXT = """**Claude Bot 指令說明**
 `@claudeBot 停止監控` — 停止背景監控
 `@claudeBot 監控狀態` — 查看監控是否在跑
 
+**平行任務（Worktree）：**
+自然語言：`@bot 在 erigon 開 branch fix/issue-42 修復 memory leak`
+或指令：`!task erigon fix/issue-42 修復 memory leak`
+完成後說「做完了」或 `!done` — 清理 worktree
+`有哪些 task` 或 `!task list` — 列出進行中的 tasks
+
 **手動指令：**
 `!repo` — 查看目前工作目錄
 `!repo <名稱或路徑>` — 手動切換專案
@@ -570,6 +665,93 @@ async def on_message(message: discord.Message):
             await message.reply(f"❌ 無法建立 thread: {e}")
         return
 
+    # !done - shortcut for !task done
+    if content == "!done":
+        content = "!task done"
+
+    # !task - create a worktree-backed task thread
+    if content.startswith("!task"):
+        args = content[5:].strip()
+
+        # !task done — clean up the worktree for this thread
+        if args == "done":
+            wt_info = channel_worktrees.get(message.channel.id)
+            if not wt_info:
+                await message.reply("❌ 這個 thread 沒有關聯的 worktree。")
+                return
+            try:
+                await remove_worktree(wt_info["repo"], wt_info["worktree"])
+                branch = wt_info["branch"]
+                del channel_worktrees[message.channel.id]
+                _save_state()
+                await message.reply(f"✅ Worktree 已清理。Branch `{branch}` 保留在 repo 中，可以用來開 PR。")
+            except Exception as e:
+                await message.reply(f"❌ 清理 worktree 失敗：{e}")
+            return
+
+        # !task list — show active tasks
+        if args in ("list", "ls", ""):
+            if not channel_worktrees:
+                await message.reply("目前沒有進行中的 task。")
+                return
+            lines = ["**進行中的 Tasks：**"]
+            for tid, info in channel_worktrees.items():
+                lines.append(f"• <#{tid}> — `{info['branch']}` (`{info['worktree']}`)")
+            await message.reply("\n".join(lines))
+            return
+
+        # !task <project> <branch> <description>
+        parts = args.split(None, 2)
+        if len(parts) < 2:
+            await message.reply("用法：`!task <專案> <branch名稱> [描述]`\n例如：`!task erigon fix/issue-42 修復 memory leak`")
+            return
+
+        project_name = parts[0]
+        branch_name = parts[1]
+        description = parts[2] if len(parts) > 2 else branch_name
+
+        # Resolve project path
+        if os.path.isdir(project_name):
+            repo_path = project_name
+        elif os.path.isdir(os.path.join(WORK_ROOT, project_name)):
+            repo_path = os.path.join(WORK_ROOT, project_name)
+        else:
+            await message.reply(f"❌ 找不到專案：`{project_name}`")
+            return
+
+        # Create worktree
+        status = await message.reply("⏳ 正在建立 worktree...")
+        try:
+            worktree_path = await create_worktree(repo_path, branch_name)
+        except Exception as e:
+            await status.edit(content=f"❌ 建立 worktree 失敗：{e}")
+            return
+
+        # Create thread
+        try:
+            thread_name = f"🔧 {description[:90]}"
+            thread = await message.create_thread(name=thread_name)
+            bot_threads.add(thread.id)
+            channel_workdir[thread.id] = worktree_path
+            channel_worktrees[thread.id] = {
+                "repo": repo_path,
+                "worktree": worktree_path,
+                "branch": branch_name,
+            }
+            _save_state()
+            await status.edit(content=f"✅ Task 已建立！\n📂 Worktree: `{worktree_path}`\n🌿 Branch: `{branch_name}`")
+            await thread.send(
+                f"🔧 **Task: {description}**\n"
+                f"📂 工作目錄：`{worktree_path}`\n"
+                f"🌿 Branch：`{branch_name}`\n\n"
+                f"直接在這裡打字開始工作。完成後用 `!task done` 清理 worktree。"
+            )
+        except Exception as e:
+            # Clean up worktree if thread creation failed
+            await remove_worktree(repo_path, worktree_path)
+            await status.edit(content=f"❌ 建立 thread 失敗：{e}")
+        return
+
     # Monitor commands via natural language
     global monitor_task, monitor_channel_id
     prompt_check = parse_prompt(content, client.user.id)
@@ -602,6 +784,71 @@ async def on_message(message: discord.Message):
             await message.reply(f"📊 監控運行中，已收集 {readings} 筆數據，每 {MONITOR_INTERVAL//60} 分鐘檢查一次。")
         else:
             await message.reply("目前沒有在跑監控。")
+        return
+
+    # Natural language: task done (in worktree thread)
+    if wants_done(check_text) and message.channel.id in channel_worktrees:
+        wt_info = channel_worktrees[message.channel.id]
+        try:
+            await remove_worktree(wt_info["repo"], wt_info["worktree"])
+            branch = wt_info["branch"]
+            del channel_worktrees[message.channel.id]
+            _save_state()
+            await message.reply(f"✅ Worktree 已清理。Branch `{branch}` 保留在 repo 中，可以用來開 PR。")
+        except Exception as e:
+            await message.reply(f"❌ 清理 worktree 失敗：{e}")
+        return
+
+    # Natural language: list tasks
+    if wants_task_list(check_text):
+        if not channel_worktrees:
+            await message.reply("目前沒有進行中的 task。")
+        else:
+            lines = ["**進行中的 Tasks：**"]
+            for tid, info in channel_worktrees.items():
+                lines.append(f"• <#{tid}> — `{info['branch']}` (`{info['worktree']}`)")
+            await message.reply("\n".join(lines))
+        return
+
+    # Natural language: create branch/worktree task
+    if wants_branch_task(check_text) and not isinstance(message.channel, discord.Thread):
+        project, branch, description = parse_branch_task(check_text)
+        if not project:
+            await message.reply("❌ 我找不到專案名稱，請提到專案名稱，例如：「在 erigon 開 branch fix/issue-42」")
+            return
+        if not branch:
+            await message.reply("❌ 我找不到 branch 名稱，請用 `xxx/yyy` 格式，例如：`fix/issue-42`")
+            return
+
+        repo_path = os.path.join(WORK_ROOT, project)
+        status = await message.reply("⏳ 正在建立 worktree...")
+        try:
+            worktree_path = await create_worktree(repo_path, branch)
+        except Exception as e:
+            await status.edit(content=f"❌ 建立 worktree 失敗：{e}")
+            return
+
+        try:
+            thread_name = f"🔧 {description[:90]}"
+            thread = await message.create_thread(name=thread_name)
+            bot_threads.add(thread.id)
+            channel_workdir[thread.id] = worktree_path
+            channel_worktrees[thread.id] = {
+                "repo": repo_path,
+                "worktree": worktree_path,
+                "branch": branch,
+            }
+            _save_state()
+            await status.edit(content=f"✅ Task 已建立！\n📂 Worktree: `{worktree_path}`\n🌿 Branch: `{branch}`")
+            await thread.send(
+                f"🔧 **Task: {description}**\n"
+                f"📂 工作目錄：`{worktree_path}`\n"
+                f"🌿 Branch：`{branch}`\n\n"
+                f"直接在這裡打字開始工作。完成後說「做完了」或 `!done` 清理 worktree。"
+            )
+        except Exception as e:
+            await remove_worktree(repo_path, worktree_path)
+            await status.edit(content=f"❌ 建立 thread 失敗：{e}")
         return
 
     # Claude prompt — support !claude, @mention, or replying to bot
