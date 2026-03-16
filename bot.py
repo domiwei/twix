@@ -186,7 +186,16 @@ def _format_progress(stderr_lines: list[str]) -> str:
     return status
 
 
-async def run_claude(prompt: str, cwd: str, session_id: str | None = None, status_msg=None) -> tuple[str, str | None]:
+async def fetch_thread_history(channel, limit: int = 20) -> str:
+    """Fetch recent messages from a Discord channel/thread as context."""
+    messages = []
+    async for msg in channel.history(limit=limit, oldest_first=True):
+        role = "assistant" if msg.author == client.user else "user"
+        messages.append(f"[{role}] {msg.content}")
+    return "\n".join(messages)
+
+
+async def run_claude(prompt: str, cwd: str, session_id: str | None = None, status_msg=None, channel=None) -> tuple[str, str | None]:
     """Run claude CLI with the given prompt in the specified directory."""
     cmd = [
         "claude",
@@ -200,11 +209,23 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None, statu
 
     raw, stderr_text = await _run_claude_proc(cmd, cwd, status_msg)
 
-    # If resume failed (session not found), retry without --resume
-    if session_id and not raw and "No conversation found" in stderr_text:
+    # If resume failed (session not found), rebuild context from thread history
+    if session_id and not raw or (session_id and "No conversation found" in stderr_text):
+        context = ""
+        if channel:
+            try:
+                context = await fetch_thread_history(channel)
+            except Exception:
+                pass
+
+        if context:
+            rebuilt_prompt = f"以下是之前的對話紀錄，請根據這些上下文繼續回答：\n\n{context}\n\n---\n用戶最新的訊息：\n{prompt}"
+        else:
+            rebuilt_prompt = prompt
+
         cmd_retry = [
             "claude",
-            "-p", prompt,
+            "-p", rebuilt_prompt,
             "--system-prompt", SYSTEM_PROMPT,
             "--output-format", "json",
             "--verbose",
@@ -640,7 +661,7 @@ async def on_message(message: discord.Message):
     thinking = await message.reply("⏳ 處理中...")
 
     try:
-        result, new_session_id = await run_claude(prompt, cwd, session_id, status_msg=thinking)
+        result, new_session_id = await run_claude(prompt, cwd, session_id, status_msg=thinking, channel=message.channel)
         if new_session_id:
             channel_session[message.channel.id] = new_session_id
             _save_state()
