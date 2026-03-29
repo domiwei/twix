@@ -847,16 +847,24 @@ def collect_metrics(config: dict) -> str:
     return "\n".join(lines)
 
 
-async def collect_metrics_via_claude(config: dict) -> str:
-    """Use Claude to collect metrics for flexible/remote monitors."""
+COLLECT_SYSTEM_PROMPT = (
+    "You are a metrics collector. Execute the requested commands, collect the data, "
+    "and return ONLY a JSON object. No commentary, no markdown fences. "
+    "Always respond in Traditional Chinese (繁體中文) for string values."
+)
+
+JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "claude-haiku-4-5-20251001")
+
+
+async def collect_metrics_via_claude(config: dict) -> dict:
+    """Use Claude to collect metrics. Returns structured JSON dict."""
     instruction = config.get("check_instruction", "")
     check_commands = config.get("check_commands", "")
     checks = config.get("checks", ["cpu", "memory"])
     service = config["service_name"]
-    knowledge = config.get("knowledge", [])
 
     prompt = (
-        f"你是 {service} 的監控助手。請執行以下檢查並回傳結果。\n"
+        f"你是 {service} 的監控助手。請執行以下檢查並收集數據。\n"
         f"監控描述：{instruction}\n"
         f"檢查項目：{', '.join(checks)}\n"
     )
@@ -864,20 +872,145 @@ async def collect_metrics_via_claude(config: dict) -> str:
         prompt += f"檢查方式：{check_commands}\n"
     if config.get("log_path"):
         prompt += f"Log 路徑：{config['log_path']}\n"
-    if knowledge:
-        prompt += "已知規則：\n" + "\n".join(f"- {k}" for k in knowledge) + "\n"
     prompt += (
-        "\n請直接執行必要的指令（SSH、curl 等）收集數據，然後用以下格式回傳：\n"
-        "1. 每個檢查項目的數值\n"
-        "2. 是否有異常\n"
-        "保持簡潔，只回傳數據和判斷。"
+        "\n請直接執行必要的指令（SSH、curl 等）收集數據。\n"
+        "完成後，回傳一個 JSON object，格式如下（不要包含 markdown code fence）：\n"
+        '{"metrics": {"cpu_percent": <number or null>, "memory_mb": <number or null>, '
+        '"disk_percent": <number or null>, "process_running": <true/false>, '
+        '"sync_status": "<描述 or null>", "peer_count": <number or null>, '
+        '"block_height": <number or null>, "error_count": <number or null>}, '
+        '"signals": ["<觀察到的趨勢或異常跡象，每條一句話>"], '
+        '"raw_notes": "<其他值得注意的觀察，100字以內>"}\n'
+        "signals 欄位很重要：把你在收集過程中注意到的任何趨勢、變化、或可疑跡象寫在這裡。"
+        "例如：「memory 比上次增加 500MB」、「log 有 3 次 reorg 但都 recover」、「peer 數量偏低」。"
+        "即使整體正常，也可以記錄觀察。沒有觀察就留空 array。\n"
+        "只回傳 JSON，不要加其他文字。缺少的欄位用 null。"
     )
 
     result, _ = await run_claude(
         prompt, config.get("project_path", WORK_ROOT),
-        system_prompt=monitor_system_prompt(config),
+        system_prompt=COLLECT_SYSTEM_PROMPT,
     )
-    return f"=== {service} Metrics @ {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n{result}"
+
+    # Parse structured output
+    cleaned = re.sub(r'```(?:json)?\s*', '', result).strip()
+    try:
+        start = cleaned.find('{')
+        end = cleaned.rfind('}')
+        if start >= 0 and end > start:
+            return json.loads(cleaned[start:end + 1])
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Fallback: wrap raw text
+    return {"metrics": {}, "raw_notes": result[:500]}
+
+
+def _build_judge_context(config: dict, history: list[dict], open_incident: dict | None) -> dict:
+    """Build structured context for judgment from history."""
+    service = config.get("service_name", config.get("name", "unknown"))
+    knowledge = config.get("knowledge", [])
+
+    readings = []
+    for h in history[-6:]:
+        entry = {"time": h["time"]}
+        data = h["data"]
+        if isinstance(data, dict):
+            entry.update(data)
+        else:
+            entry["raw"] = str(data)[:300]
+        readings.append(entry)
+
+    context = {
+        "service": service,
+        "readings": readings,
+        "has_open_incident": bool(open_incident),
+    }
+    if knowledge:
+        context["knowledge"] = knowledge[-10:]
+    return context
+
+
+def _parse_judge_result(result: str) -> dict:
+    """Parse JSON from judge response with fallback."""
+    cleaned = re.sub(r'```(?:json)?\s*', '', result).strip()
+    try:
+        start = cleaned.find('{')
+        end = cleaned.rfind('}')
+        if start >= 0 and end > start:
+            return json.loads(cleaned[start:end + 1])
+    except (json.JSONDecodeError, TypeError):
+        pass
+    is_anomaly = any(w in result.lower() for w in ("異常", "anomaly", "error", "critical"))
+    return {"anomaly": is_anomaly, "summary": result[:200], "details": result, "confidence": "low"}
+
+
+JUDGE_PROMPT_TEMPLATE = (
+    "你是 {service} 的監控判斷助手。根據以下結構化數據判斷是否有異常。\n\n"
+    "{context_json}\n\n"
+    "回覆一個 JSON object（不要 markdown code fence）：\n"
+    '{{"anomaly": true/false, "summary": "簡短描述（繁體中文）", '
+    '"details": "詳細分析（繁體中文）", '
+    '"confidence": "high/medium/low", '
+    '"lesson": "新學到的知識 or null"}}\n\n'
+    "confidence 說明：\n"
+    "- high: 數據明確，判斷有把握\n"
+    "- medium: 有些跡象但不確定，可能需要更多數據\n"
+    "- low: 數據不足或訊號矛盾，無法確定判斷"
+)
+
+ESCALATE_PROMPT_TEMPLATE = (
+    "你是 {service} 的資深監控分析師。Haiku 初步判斷的 confidence 為 low，需要你做深度分析。\n\n"
+    "=== Haiku 的初步判斷 ===\n{haiku_result}\n\n"
+    "=== 完整監控數據 ===\n{context_json}\n\n"
+    "請仔細分析所有 signals 和 metrics 的趨勢，做出最終判斷。\n"
+    "回覆 JSON（不要 markdown code fence）：\n"
+    '{{"anomaly": true/false, "summary": "簡短描述（繁體中文）", '
+    '"details": "詳細分析（繁體中文）", '
+    '"lesson": "新學到的知識 or null"}}'
+)
+
+
+async def judge_metrics(config: dict, history: list[dict], open_incident: dict | None) -> dict:
+    """Two-tier judgment: Haiku first, escalate to Opus if confidence is low."""
+    service = config.get("service_name", config.get("name", "unknown"))
+    context = _build_judge_context(config, history, open_incident)
+    context_json = json.dumps(context, ensure_ascii=False, indent=2)
+
+    # ── Tier 1: Haiku (fast, cheap) ──
+    prompt = JUDGE_PROMPT_TEMPLATE.format(service=service, context_json=context_json)
+    cmd = [
+        "claude",
+        "-p", prompt,
+        "--model", JUDGE_MODEL,
+        "--output-format", "stream-json",
+        "--max-turns", "1",
+    ]
+    result, _ = await _run_claude_stream(cmd, config.get("project_path", WORK_ROOT))
+    analysis = _parse_judge_result(result or "")
+
+    confidence = analysis.get("confidence", "high")
+    print(f"[JUDGE] {config['name']} Haiku verdict: anomaly={analysis.get('anomaly')}, confidence={confidence}", flush=True)
+
+    # ── Tier 2: Escalate to Opus if low confidence ──
+    if confidence == "low":
+        print(f"[JUDGE] {config['name']} escalating to Opus for deep analysis", flush=True)
+        haiku_summary = json.dumps(analysis, ensure_ascii=False)
+        escalate_prompt = ESCALATE_PROMPT_TEMPLATE.format(
+            service=service, haiku_result=haiku_summary, context_json=context_json,
+        )
+        escalate_cmd = [
+            "claude",
+            "-p", escalate_prompt,
+            "--model", CLAUDE_MODEL,
+            "--output-format", "stream-json",
+            "--max-turns", "1",
+        ]
+        escalate_result, _ = await _run_claude_stream(escalate_cmd, config.get("project_path", WORK_ROOT))
+        opus_analysis = _parse_judge_result(escalate_result or "")
+        print(f"[JUDGE] {config['name']} Opus verdict: anomaly={opus_analysis.get('anomaly')}", flush=True)
+        return opus_analysis
+
+    return analysis
 
 
 def quick_threshold_check(metrics: str) -> dict | None:
@@ -1122,151 +1255,71 @@ async def monitor_loop(monitor_id: str, channel):
     while True:
         await asyncio.sleep(check_interval)
         try:
+            # ── Step 1: Collect (fresh Claude session, structured output) ──
             if use_claude_collect:
-                # Flexible monitor: let Claude collect and analyze
                 metrics = await collect_metrics_via_claude(config)
             else:
-                # Local project monitor: use fast local collection
                 metrics = collect_metrics(config)
 
-            # Keep history
+            # ── Step 2: Store structured artifact in history ──
             history = monitor_histories.setdefault(monitor_id, [])
             history.append({"time": time.strftime("%H:%M:%S"), "data": metrics})
-            if len(history) > 36:  # ~3 hours at 5-min intervals
+            if len(history) > 36:
                 monitor_histories[monitor_id] = history[-36:]
 
             open_incident = find_incident_by_monitor(monitor_id)
 
+            # ── Step 3: Judge (clean context via Haiku, no tool-call pollution) ──
             if use_claude_collect:
-                # Claude already analyzed — ask it to judge anomaly
-                history_text = "\n\n".join(
-                    f"--- {h['time']} ---\n{h['data']}"
-                    for h in monitor_histories[monitor_id][-3:]
-                )
-                judge_prompt = (
-                    f"根據以下最近的監控數據，判斷是否有異常。\n\n{history_text}\n\n"
-                    '回覆 JSON: {"anomaly": true/false, "summary": "簡短描述", "details": "詳細分析"}'
-                )
-                result, _ = await run_claude(
-                    judge_prompt, config.get("project_path", WORK_ROOT),
-                    system_prompt=monitor_system_prompt(config),
-                )
-                # Strip markdown code blocks before parsing
-                cleaned = re.sub(r'```(?:json)?\s*', '', result).strip()
-                try:
-                    start = cleaned.find('{')
-                    end = cleaned.rfind('}')
-                    if start >= 0 and end > start:
-                        analysis = json.loads(cleaned[start:end + 1])
-                    else:
-                        analysis = json.loads(cleaned)
-                    is_anomaly = analysis.get("anomaly", False)
-                    summary = analysis.get("summary", "異常")
-                    details = analysis.get("details", result)
-                    _maybe_learn(config, analysis)
-                except (json.JSONDecodeError, TypeError):
-                    # If Claude didn't return JSON, check for keywords
-                    is_anomaly = any(w in result.lower() for w in ("異常", "anomaly", "error", "critical", "warning"))
-                    summary = result[:200]
-                    details = result
-
-                if is_anomaly:
-                    if open_incident:
-                        open_incident["consecutive_ok"] = 0
-                        thread = client.get_channel(open_incident["thread_id"])
-                        if thread:
-                            update_text = f"📊 **持續異常** ({time.strftime('%H:%M')})\n{summary}\n\n{details}"
-                            for chunk in split_message(update_text):
-                                await pikmin_send(thread, chunk, pikmin)
-                    else:
-                        try:
-                            await create_incident(monitor_id, channel, summary, details)
-                        except Exception as e:
-                            print(f"[MONITOR] Failed to create incident: {e}", flush=True)
-                    consecutive_ok_for_summary = 0
-                else:
-                    consecutive_ok_for_summary += 1
-                    if open_incident:
-                        open_incident["consecutive_ok"] = open_incident.get("consecutive_ok", 0) + 1
-                        if open_incident["consecutive_ok"] >= 3:
-                            await resolve_incident(open_incident)
-                        else:
-                            thread = client.get_channel(open_incident["thread_id"])
-                            if thread:
-                                await pikmin_send(thread,
-                                    f"📊 檢查正常 ({open_incident['consecutive_ok']}/3)，"
-                                    f"連續 3 次正常就自動關閉。",
-                                    pikmin)
-                        _save_monitors()
+                analysis = await judge_metrics(config, history, open_incident)
+                is_anomaly = analysis.get("anomaly", False)
+                summary = analysis.get("summary", "異常")
+                details = analysis.get("details", "")
+                _maybe_learn(config, analysis)
             else:
-                # Local monitor: quick threshold check (free, no Claude call)
                 threshold_hit = quick_threshold_check(metrics)
-
                 if threshold_hit:
-                    # Threshold hit — call Claude for detailed analysis
-                    history_text = "\n\n".join(
-                        f"--- {h['time']} ---\n{h['data']}"
-                        for h in monitor_histories[monitor_id][-6:]
-                    )
-                    prompt = (
-                        f"以下是 {config['name']} 的歷史 metrics（最新在最下面）：\n\n{history_text}\n\n"
-                        f"快速檢查發現：{threshold_hit['msg']}\n請詳細分析是否有異常及建議。"
-                    )
-                    result, _ = await run_claude(
-                        prompt, config.get("project_path", WORK_ROOT),
-                        system_prompt=monitor_system_prompt(config),
-                    )
+                    analysis = await judge_metrics(config, history, open_incident)
+                    is_anomaly = analysis.get("anomaly", False)
+                    summary = analysis.get("summary", threshold_hit["msg"])
+                    details = analysis.get("details", "")
+                    _maybe_learn(config, analysis)
+                else:
+                    is_anomaly = False
+                    summary = ""
+                    details = ""
 
-                    # Parse Claude response
-                    summary = threshold_hit["msg"]
-                    details = result
-                    cleaned_result = re.sub(r'```(?:json)?\s*', '', result).strip()
+            # ── Step 4: Act on judgment ──
+            if is_anomaly:
+                if open_incident:
+                    open_incident["consecutive_ok"] = 0
+                    thread = client.get_channel(open_incident["thread_id"])
+                    if thread:
+                        update_text = f"📊 **持續異常** ({time.strftime('%H:%M')})\n{summary}\n\n{details}"
+                        for chunk in split_message(update_text):
+                            await pikmin_send(thread, chunk, pikmin)
+                else:
                     try:
-                        rs = cleaned_result.find('{')
-                        re_ = cleaned_result.rfind('}')
-                        if rs >= 0 and re_ > rs:
-                            analysis = json.loads(cleaned_result[rs:re_ + 1])
-                        else:
-                            analysis = json.loads(cleaned_result)
-                        summary = analysis.get("summary", summary)
-                        details = analysis.get("details", details)
-                        _maybe_learn(config, analysis)
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                    if open_incident:
-                        open_incident["consecutive_ok"] = 0
+                        await create_incident(monitor_id, channel, summary, details)
+                    except Exception as e:
+                        print(f"[MONITOR] Failed to create incident: {e}", flush=True)
+                consecutive_ok_for_summary = 0
+            else:
+                consecutive_ok_for_summary += 1
+                if open_incident:
+                    open_incident["consecutive_ok"] = open_incident.get("consecutive_ok", 0) + 1
+                    if open_incident["consecutive_ok"] >= 3:
+                        await resolve_incident(open_incident)
+                    else:
                         thread = client.get_channel(open_incident["thread_id"])
                         if thread:
-                            update_text = f"📊 **持續異常** ({time.strftime('%H:%M')})\n{summary}\n\n{details}"
-                            for chunk in split_message(update_text):
-                                await pikmin_send(thread, chunk, pikmin)
-                    else:
-                        try:
-                            await create_incident(monitor_id, channel, summary, details)
-                        except Exception as e:
-                            print(f"[MONITOR] Failed to create incident: {e}", flush=True)
+                            await pikmin_send(thread,
+                                f"📊 檢查正常 ({open_incident['consecutive_ok']}/3)，"
+                                f"連續 3 次正常就自動關閉。",
+                                pikmin)
+                    _save_monitors()
 
-                    consecutive_ok_for_summary = 0
-
-                else:
-                    # Normal
-                    consecutive_ok_for_summary += 1
-
-                    if open_incident:
-                        open_incident["consecutive_ok"] = open_incident.get("consecutive_ok", 0) + 1
-                        if open_incident["consecutive_ok"] >= 3:
-                            await resolve_incident(open_incident)
-                        else:
-                            thread = client.get_channel(open_incident["thread_id"])
-                            if thread:
-                                await pikmin_send(thread,
-                                    f"📊 檢查正常 ({open_incident['consecutive_ok']}/3)，"
-                                    f"連續 3 次正常就自動關閉。",
-                                    pikmin)
-                        _save_monitors()
-
-            # Periodic summary
+            # ── Periodic summary ──
             now = time.time()
             if now - last_summary_time >= summary_interval:
                 last_summary_time = now
@@ -1283,18 +1336,11 @@ async def monitor_loop(monitor_id: str, channel):
                     summary_text += "✅ 一切正常\n"
                 await pikmin_send(channel, summary_text, pikmin)
 
-            if use_claude_collect:
-                print(
-                    f"[MONITOR] {config['name']} {time.strftime('%H:%M:%S')} - "
-                    f"{'ANOMALY' if is_anomaly else 'OK'}",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[MONITOR] {config['name']} {time.strftime('%H:%M:%S')} - "
-                    f"{'ANOMALY' if threshold_hit else 'OK'}",
-                    flush=True,
-                )
+            print(
+                f"[MONITOR] {config['name']} {time.strftime('%H:%M:%S')} - "
+                f"{'ANOMALY' if is_anomaly else 'OK'}",
+                flush=True,
+            )
 
         except asyncio.CancelledError:
             raise
