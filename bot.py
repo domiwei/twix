@@ -47,6 +47,51 @@ SYSTEM_PROMPT = (
     "Do not over-explain obvious things. Prioritize actionable answers."
 )
 
+EVALUATOR_PROMPT = (
+    "You are a senior code reviewer and fact-checker. You will receive the original user question "
+    "and another agent's response. Your job:\n"
+    "1. Check for factual errors, logical mistakes, or misleading information.\n"
+    "2. If code was written or modified, check for bugs, security issues, edge cases, and whether it actually solves the problem.\n"
+    "3. Point out anything important that was missed.\n"
+    "4. If the response is good, say so briefly — don't invent problems.\n\n"
+    "Be concise and direct. Focus on substance, not style. "
+    "Always respond in Traditional Chinese (繁體中文) unless the user writes in English. "
+    "Start your review directly — no preamble like '我來看看' or '讓我檢查'."
+)
+
+EVALUATOR_MODEL = os.environ.get("EVALUATOR_MODEL", "claude-sonnet-4-6")
+PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "claude-opus-4-6")
+WRITE_TOOLS = {"Edit", "Write", "Bash", "NotebookEdit"}
+
+PLANNER_PROMPT = (
+    "You are a senior software architect and project planner. "
+    "Given a task description and optional codebase context, produce a sprint contract — "
+    "a structured execution plan that generators and evaluators will follow.\n\n"
+    "Output ONLY valid JSON in this format:\n"
+    "```json\n"
+    '{\n'
+    '  "summary": "one-line summary of the overall task",\n'
+    '  "steps": [\n'
+    '    {\n'
+    '      "id": 1,\n'
+    '      "title": "step title",\n'
+    '      "description": "what to do",\n'
+    '      "acceptance": "how to verify this step is done correctly",\n'
+    '      "depends_on": []  // list of step ids this depends on, empty = can run in parallel\n'
+    '    }\n'
+    '  ]\n'
+    '}\n'
+    "```\n\n"
+    "Guidelines:\n"
+    "- Read the relevant codebase files first to understand the current state.\n"
+    "- Each step should be small enough for one agent session (1-15 turns).\n"
+    "- Mark steps that can run in parallel with empty depends_on.\n"
+    "- Acceptance criteria must be concrete and testable.\n"
+    "- Keep total steps under 8.\n"
+    "- Always respond in Traditional Chinese (繁體中文) for titles/descriptions.\n"
+    "- Output ONLY the JSON block, no other text."
+)
+
 
 def monitor_system_prompt(config: dict) -> str:
     service_name = config.get("service_name", config.get("name", "unknown"))
@@ -156,7 +201,11 @@ pending_monitors: dict[int, dict] = {}  # channel_id -> pending monitor config
 pending_monitor_setup: set[int] = set()  # channel_ids awaiting monitor description
 pending_monitor_removals: dict[int, dict] = {}  # channel_id -> pending removal info
 channel_session_ts: dict[int, float] = {}  # channel_id -> last session activity timestamp
+channel_cumulative_turns: dict[int, int] = {}  # channel_id -> total turns in current session
+channel_debug_context: dict[int, list[str]] = {}  # channel_id -> list of debug summaries from past rounds
 _channel_locks: dict[int, asyncio.Lock] = {}  # per-channel lock to prevent concurrent processing
+
+CONTEXT_RELAY_THRESHOLD = 30  # auto-reset session after this many cumulative turns
 
 
 def _get_channel_lock(channel_id: int) -> asyncio.Lock:
@@ -518,7 +567,7 @@ def _format_tool_desc(name: str, input_data: dict) -> str:
 CLAUDE_TIMEOUT = 600  # 10 minutes max per Claude call
 
 
-async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple[str, str | None]:
+async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple[str, str | None, list[str], int]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -530,6 +579,7 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple
     session_id = None
     tools_used: list[str] = []
     assistant_texts: list[str] = []  # collect text blocks as fallback
+    num_turns = 0
     current_status = "🤔 思考中..."
     last_update = 0.0
     UPDATE_INTERVAL = 2.0
@@ -588,11 +638,12 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple
                         print(f"[CLAUDE] text: ({len(txt)} chars) {txt[:80]}...", flush=True)
                         await update_status("💬 撰寫回覆中...")
             elif etype == "result":
+                nonlocal num_turns
                 result_text = event.get("result", "")
                 session_id = event.get("session_id")
                 cost = event.get("total_cost_usd", 0)
-                turns = event.get("num_turns", 0)
-                print(f"[CLAUDE] done: {turns} turns, ${cost:.4f}, result_len={len(result_text)}", flush=True)
+                num_turns = event.get("num_turns", 0)
+                print(f"[CLAUDE] done: {num_turns} turns, ${cost:.4f}, result_len={len(result_text)}", flush=True)
 
     async def _do_stream():
         events_task = asyncio.create_task(read_events())
@@ -651,7 +702,7 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple
     if not result_text:
         print(f"[CLAUDE] WARNING: no result from any source", flush=True)
 
-    return result_text, session_id
+    return result_text, session_id, tools_used, num_turns
 
 
 async def fetch_thread_history(channel, limit: int = 20, max_chars: int = 8000) -> str:
@@ -672,12 +723,81 @@ async def fetch_thread_history(channel, limit: int = 20, max_chars: int = 8000) 
 MAX_TURNS = 25  # prevent runaway tool loops
 
 
+async def _generate_debug_summary(session_id: str, cwd: str) -> str:
+    """Ask Claude to summarize the current debug session for context relay."""
+    summary_prompt = (
+        "請總結目前的 debug 進度。格式如下：\n"
+        "1. **問題描述**：原始問題是什麼\n"
+        "2. **已嘗試**：做了哪些嘗試，結果如何\n"
+        "3. **已排除**：哪些方向已經確認不是問題\n"
+        "4. **當前線索**：目前最可能的原因或方向\n"
+        "5. **已修改的檔案**：列出改了哪些檔案、改了什麼\n\n"
+        "簡潔扼要，只寫重點。這份摘要會交給下一輪 agent 接手。"
+    )
+    cmd = [
+        "claude", "-p", summary_prompt,
+        "--resume", session_id,
+        "--model", SUMMARY_MODEL,
+        "--output-format", "text",
+        "--max-turns", "1",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+        return stdout.decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        print(f"[RELAY] summary generation failed: {e}", flush=True)
+        return ""
+
+
+def _build_relay_prompt(prompt: str, channel_id: int) -> str:
+    """Build a prompt with debug context from previous rounds."""
+    contexts = channel_debug_context.get(channel_id, [])
+    if not contexts:
+        return prompt
+    history = "\n\n---\n\n".join(contexts)
+    return (
+        f"## 之前的 debug 紀錄\n"
+        f"以下是之前幾輪 debug 的摘要，請根據這些背景繼續工作：\n\n{history}\n\n"
+        f"---\n\n## 用戶最新的訊息\n{prompt}"
+    )
+
+
 async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
-                     status_msg=None, channel=None, system_prompt: str | None = None) -> tuple[str, str | None]:
+                     status_msg=None, channel=None, system_prompt: str | None = None) -> tuple[str, str | None, list[str]]:
     sys_prompt = system_prompt or SYSTEM_PROMPT
+    ch_id = channel.id if channel else None
+
+    # ── Context Relay: check if session needs reset ──
+    if ch_id and session_id:
+        cumulative = channel_cumulative_turns.get(ch_id, 0)
+        if cumulative >= CONTEXT_RELAY_THRESHOLD:
+            print(f"[RELAY] channel {ch_id} hit {cumulative} turns, resetting session", flush=True)
+            # Generate summary from old session
+            summary = await _generate_debug_summary(session_id, cwd)
+            if summary:
+                if ch_id not in channel_debug_context:
+                    channel_debug_context[ch_id] = []
+                channel_debug_context[ch_id].append(f"[第 {len(channel_debug_context[ch_id]) + 1} 輪]\n{summary}")
+                # Keep only last 5 rounds
+                channel_debug_context[ch_id] = channel_debug_context[ch_id][-5:]
+                print(f"[RELAY] saved debug summary ({len(summary)} chars), starting fresh session", flush=True)
+            # Reset session
+            session_id = None
+            channel_cumulative_turns[ch_id] = 0
+            if channel:
+                await channel.send("🔄 Context 已接力 — 開啟新 session，保留之前的 debug 紀錄。")
+
+    # Build prompt with relay context if available
+    effective_prompt = _build_relay_prompt(prompt, ch_id) if ch_id and not session_id and channel_debug_context.get(ch_id) else prompt
+
     cmd = [
         "claude",
-        "-p", prompt,
+        "-p", effective_prompt,
         "--model", CLAUDE_MODEL,
         "--system-prompt", sys_prompt,
         "--output-format", "stream-json",
@@ -687,7 +807,7 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
     if session_id:
         cmd.extend(["--resume", session_id])
 
-    result, new_session_id = await _run_claude_stream(cmd, cwd, status_msg)
+    result, new_session_id, tools, turns = await _run_claude_stream(cmd, cwd, status_msg)
 
     # If resume failed, rebuild context from thread history
     if session_id and not result:
@@ -710,13 +830,355 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
             "--verbose",
             "--max-turns", str(MAX_TURNS),
         ]
-        result, new_session_id = await _run_claude_stream(cmd_retry, cwd, status_msg)
+        result, new_session_id, tools, turns = await _run_claude_stream(cmd_retry, cwd, status_msg)
+
+    # Track cumulative turns
+    if ch_id:
+        channel_cumulative_turns[ch_id] = channel_cumulative_turns.get(ch_id, 0) + turns
 
     # Track session activity timestamp
     if new_session_id and channel:
         channel_session_ts[channel.id] = time.time()
 
-    return result or "(no output)", new_session_id
+    return result or "(no output)", new_session_id, tools
+
+
+# ── Evaluator (GAN-inspired review agent) ───────────────────────────────────
+
+
+async def run_evaluator(user_prompt: str, generator_result: str, cwd: str) -> str:
+    """Run an evaluator agent to review the generator's output."""
+    eval_prompt = (
+        f"## 用戶原始問題\n{user_prompt}\n\n"
+        f"## Generator 的回答\n{generator_result}\n\n"
+        f"請 review 以上回答。"
+    )
+    cmd = [
+        "claude",
+        "-p", eval_prompt,
+        "--model", EVALUATOR_MODEL,
+        "--system-prompt", EVALUATOR_PROMPT,
+        "--output-format", "stream-json",
+        "--max-turns", "1",
+    ]
+    result, _, _, _ = await _run_claude_stream(cmd, cwd)
+    return result or ""
+
+
+def _has_write_tools(tools_used: list[str]) -> bool:
+    """Check if any write-type tools were used."""
+    for desc in tools_used:
+        for tool in WRITE_TOOLS:
+            if tool in desc:
+                return True
+    return False
+
+
+class ReviewView(discord.ui.View):
+    """Button to request an evaluator review on a pure-answer response."""
+
+    def __init__(self, user_prompt: str, generator_result: str, cwd: str,
+                 channel, generator_pikmin: dict | None):
+        super().__init__(timeout=300)  # 5 minutes
+        self.user_prompt = user_prompt
+        self.generator_result = generator_result
+        self.cwd = cwd
+        self.channel = channel
+        self.generator_pikmin = generator_pikmin
+
+    @discord.ui.button(label="🔍 召喚 Review", style=discord.ButtonStyle.secondary)
+    async def review_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        eval_pikmin = _pick_eval_pikmin(self.generator_pikmin) if self.generator_pikmin else PIKMIN_POOL[1]
+        thinking = await pikmin_send(
+            self.channel, "🔍 Review 中...", eval_pikmin
+        )
+
+        try:
+            review = await run_evaluator(
+                self.user_prompt, self.generator_result, self.cwd
+            )
+            if review:
+                chunks = split_message(review)
+                try:
+                    await pikmin_edit(thinking, chunks[0], self.channel)
+                except Exception:
+                    await pikmin_send(self.channel, chunks[0], eval_pikmin)
+                for chunk in chunks[1:]:
+                    await pikmin_send(self.channel, chunk, eval_pikmin)
+            else:
+                await pikmin_edit(thinking, "✅ 沒有發現問題。", self.channel)
+        except Exception as e:
+            print(f"[EVALUATOR] ERROR: {e}", flush=True)
+            try:
+                await pikmin_edit(thinking, f"❌ Review 失敗: {e}", self.channel)
+            except Exception:
+                await pikmin_send(self.channel, f"❌ Review 失敗: {e}", eval_pikmin)
+
+
+# ── Planner (Sprint Contract) ───────────────────────────────────────────────
+
+# Active plans awaiting confirmation: channel_id -> plan data
+pending_plans: dict[int, dict] = {}
+
+
+async def generate_plan(task: str, cwd: str) -> dict | None:
+    """Use Planner agent to produce a sprint contract."""
+    cmd = [
+        "claude",
+        "-p", f"任務：{task}\n\n請分析 codebase 並產出 sprint contract。",
+        "--model", PLANNER_MODEL,
+        "--system-prompt", PLANNER_PROMPT,
+        "--output-format", "stream-json",
+        "--verbose",
+        "--max-turns", str(MAX_TURNS),
+    ]
+    result, _, _, _ = await _run_claude_stream(cmd, cwd)
+    if not result:
+        return None
+    # Extract JSON from result
+    cleaned = re.sub(r'```(?:json)?\s*', '', result).strip().rstrip('`')
+    start = cleaned.find('{')
+    end = cleaned.rfind('}')
+    if start >= 0 and end > start:
+        try:
+            return json.loads(cleaned[start:end + 1])
+        except json.JSONDecodeError as e:
+            print(f"[PLANNER] JSON parse failed: {e}", flush=True)
+    return None
+
+
+def format_plan_display(plan: dict) -> str:
+    """Format a sprint contract for Discord display."""
+    lines = [f"## 📋 Sprint Contract\n**{plan.get('summary', '')}**\n"]
+    steps = plan.get("steps", [])
+    # Group into parallel batches
+    for step in steps:
+        deps = step.get("depends_on", [])
+        dep_str = f" (依賴步驟 {', '.join(str(d) for d in deps)})" if deps else " ⚡ 可並行"
+        lines.append(
+            f"**{step['id']}.** {step['title']}{dep_str}\n"
+            f"  {step['description']}\n"
+            f"  ✅ 驗收：{step['acceptance']}\n"
+        )
+    return "\n".join(lines)
+
+
+MAX_GEN_EVAL_ROUNDS = 3  # max back-and-forth rounds between generator and evaluator
+
+
+def _pick_eval_pikmin(gen_pikmin: dict) -> dict:
+    """Pick a different pikmin for the evaluator."""
+    gen_idx = None
+    for i, p in enumerate(PIKMIN_POOL):
+        if p["name"] == gen_pikmin["name"]:
+            gen_idx = i
+            break
+    eval_idx = 1 if gen_idx != 1 else 0
+    return PIKMIN_POOL[eval_idx]
+
+
+async def generator_evaluator_loop(
+    initial_prompt: str,
+    cwd: str,
+    channel,
+    gen_pikmin: dict,
+    eval_context: str = "",
+    max_rounds: int = MAX_GEN_EVAL_ROUNDS,
+    show_status_prefix: str = "",
+) -> tuple[str, bool]:
+    """
+    Run a Generator-Evaluator dialogue loop.
+    Generator produces output, Evaluator reviews. If FAIL, Evaluator's feedback
+    is sent back to Generator (resuming its session) for correction.
+    Returns (final_result, passed).
+    """
+    eval_pikmin = _pick_eval_pikmin(gen_pikmin)
+    session_id = None
+    result = ""
+    prefix = f"{show_status_prefix} " if show_status_prefix else ""
+
+    for round_num in range(1, max_rounds + 1):
+        round_label = f"(第 {round_num}/{max_rounds} 輪)" if max_rounds > 1 else ""
+
+        # ── Generator turn ──
+        if round_num == 1:
+            gen_prompt = initial_prompt
+            gen_thinking = await pikmin_send(channel, f"{prefix}⚙️ 執行中... {round_label}", gen_pikmin)
+        else:
+            # Resume with evaluator feedback
+            gen_prompt = (
+                f"Evaluator 的回饋如下，請根據回饋修正：\n\n{review}\n\n"
+                f"修正完成後說明你改了什麼。"
+            )
+            gen_thinking = await pikmin_send(channel, f"{prefix}🔧 根據回饋修正中... {round_label}", gen_pikmin)
+
+        result, new_session_id, tools, _ = await run_claude(
+            gen_prompt, cwd, session_id=session_id, status_msg=gen_thinking, channel=channel,
+        )
+        if new_session_id:
+            session_id = new_session_id
+
+        # Show generator result
+        chunks = split_message(result)
+        try:
+            await pikmin_edit(gen_thinking, chunks[0], channel)
+        except Exception:
+            await pikmin_send(channel, chunks[0], gen_pikmin)
+        for chunk in chunks[1:]:
+            await pikmin_send(channel, chunk, gen_pikmin)
+
+        # ── Evaluator turn ──
+        eval_thinking = await pikmin_send(channel, f"{prefix}🔍 Review 中... {round_label}", eval_pikmin)
+
+        eval_prompt_text = ""
+        if eval_context:
+            eval_prompt_text += f"{eval_context}\n\n"
+        eval_prompt_text += f"## Generator 的回答\n{result}\n\n"
+        if round_num > 1:
+            eval_prompt_text += f"（這是 Generator 第 {round_num} 次修改）\n\n"
+        eval_prompt_text += "請 review。如果有問題，具體指出要修正什麼。最後明確回答：PASS 或 FAIL。"
+
+        review = await run_evaluator(eval_prompt_text, result, cwd)
+
+        if review:
+            review_chunks = split_message(review)
+            try:
+                await pikmin_edit(eval_thinking, review_chunks[0], channel)
+            except Exception:
+                await pikmin_send(channel, review_chunks[0], eval_pikmin)
+            for chunk in review_chunks[1:]:
+                await pikmin_send(channel, chunk, eval_pikmin)
+        else:
+            await pikmin_edit(eval_thinking, "✅ 沒有發現問題。", channel)
+
+        passed = not review or "FAIL" not in review.upper()
+        if passed:
+            return result, True
+
+        # Last round and still failing
+        if round_num == max_rounds:
+            await channel.send(f"⚠️ 經 {max_rounds} 輪修正仍未完全通過 review。")
+            return result, False
+
+    return result, False
+
+
+async def execute_plan_step(step: dict, cwd: str, channel, pikmin: dict,
+                            plan_summary: str) -> tuple[str, bool]:
+    """Execute a single plan step with Generator-Evaluator dialogue."""
+    initial_prompt = (
+        f"## Sprint Contract 步驟 {step['id']}: {step['title']}\n\n"
+        f"**整體任務**：{plan_summary}\n\n"
+        f"**本步驟要求**：{step['description']}\n\n"
+        f"**驗收標準**：{step['acceptance']}\n\n"
+        f"請完成這個步驟。完成後說明你做了什麼。"
+    )
+
+    eval_context = (
+        f"## Sprint Contract 步驟 {step['id']}: {step['title']}\n"
+        f"**驗收標準**：{step['acceptance']}"
+    )
+
+    return await generator_evaluator_loop(
+        initial_prompt=initial_prompt,
+        cwd=cwd,
+        channel=channel,
+        gen_pikmin=pikmin,
+        eval_context=eval_context,
+        show_status_prefix=f"步驟 {step['id']}",
+    )
+
+
+async def execute_plan(plan: dict, cwd: str, channel, base_pikmin_idx: int):
+    """Execute a full sprint contract with dependency resolution."""
+    steps = plan.get("steps", [])
+    summary = plan.get("summary", "")
+    completed: set[int] = set()
+    results: dict[int, str] = {}
+
+    await channel.send(f"🚀 **開始執行 Sprint Contract** — 共 {len(steps)} 個步驟")
+
+    while len(completed) < len(steps):
+        # Find steps that are ready (all dependencies met)
+        ready = [
+            s for s in steps
+            if s["id"] not in completed
+            and all(d in completed for d in s.get("depends_on", []))
+        ]
+        if not ready:
+            await channel.send("❌ 無法繼續 — 有步驟的依賴無法滿足。")
+            break
+
+        if len(ready) == 1:
+            step = ready[0]
+            pidx = (base_pikmin_idx + step["id"]) % len(PIKMIN_POOL)
+            pikmin = PIKMIN_POOL[pidx]
+            result, passed = await execute_plan_step(step, cwd, channel, pikmin, summary)
+            completed.add(step["id"])
+            results[step["id"]] = result
+            if not passed:
+                await channel.send(f"⚠️ 步驟 {step['id']} 未完全通過驗收，繼續下一步。")
+        else:
+            # Parallel execution
+            await channel.send(f"⚡ 並行執行 {len(ready)} 個步驟: {', '.join(s['title'] for s in ready)}")
+
+            async def _exec_step(step):
+                pidx = (base_pikmin_idx + step["id"]) % len(PIKMIN_POOL)
+                pikmin = PIKMIN_POOL[pidx]
+                return step["id"], *(await execute_plan_step(step, cwd, channel, pikmin, summary))
+
+            tasks = [asyncio.create_task(_exec_step(s)) for s in ready]
+            for coro in asyncio.as_completed(tasks):
+                step_id, result, passed = await coro
+                completed.add(step_id)
+                results[step_id] = result
+                if not passed:
+                    await channel.send(f"⚠️ 步驟 {step_id} 未完全通過驗收。")
+
+    await channel.send(f"🏁 **Sprint Contract 完成！** {len(completed)}/{len(steps)} 步驟已完成。")
+
+
+class PlanView(discord.ui.View):
+    """Buttons for plan confirmation: Start / Modify / Cancel."""
+
+    def __init__(self, plan: dict, task: str, cwd: str, channel, pikmin_idx: int):
+        super().__init__(timeout=600)  # 10 minutes
+        self.plan = plan
+        self.task = task
+        self.cwd = cwd
+        self.channel = channel
+        self.pikmin_idx = pikmin_idx
+
+    def _disable_all(self):
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="✅ 開始執行", style=discord.ButtonStyle.success)
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable_all()
+        await interaction.response.edit_message(view=self)
+        pending_plans.pop(self.channel.id, None)
+        asyncio.create_task(execute_plan(self.plan, self.cwd, self.channel, self.pikmin_idx))
+
+    @discord.ui.button(label="✏️ 修改", style=discord.ButtonStyle.primary)
+    async def modify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable_all()
+        await interaction.response.edit_message(view=self)
+        await self.channel.send("請說明要怎麼修改這個計畫，例如：「步驟 2 和 3 合併」、「加一個測試步驟」等。")
+        # Store plan for modification — next message in this channel will be treated as modification
+        pending_plans[self.channel.id] = {
+            "plan": self.plan, "task": self.task, "cwd": self.cwd, "pikmin_idx": self.pikmin_idx,
+        }
+
+    @discord.ui.button(label="❌ 取消", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable_all()
+        await interaction.response.edit_message(view=self)
+        pending_plans.pop(self.channel.id, None)
+        await self.channel.send("📋 計畫已取消。")
 
 
 # ── Thread Summaries ─────────────────────────────────────────────────────────
@@ -887,7 +1349,7 @@ async def collect_metrics_via_claude(config: dict) -> dict:
         "只回傳 JSON，不要加其他文字。缺少的欄位用 null。"
     )
 
-    result, _ = await run_claude(
+    result, _, _ = await run_claude(
         prompt, config.get("project_path", WORK_ROOT),
         system_prompt=COLLECT_SYSTEM_PROMPT,
     )
@@ -985,7 +1447,7 @@ async def judge_metrics(config: dict, history: list[dict], open_incident: dict |
         "--output-format", "stream-json",
         "--max-turns", "1",
     ]
-    result, _ = await _run_claude_stream(cmd, config.get("project_path", WORK_ROOT))
+    result, _, _, _ = await _run_claude_stream(cmd, config.get("project_path", WORK_ROOT))
     analysis = _parse_judge_result(result or "")
 
     confidence = analysis.get("confidence", "high")
@@ -1005,7 +1467,7 @@ async def judge_metrics(config: dict, history: list[dict], open_incident: dict |
             "--output-format", "stream-json",
             "--max-turns", "1",
         ]
-        escalate_result, _ = await _run_claude_stream(escalate_cmd, config.get("project_path", WORK_ROOT))
+        escalate_result, _, _, _ = await _run_claude_stream(escalate_cmd, config.get("project_path", WORK_ROOT))
         opus_analysis = _parse_judge_result(escalate_result or "")
         print(f"[JUDGE] {config['name']} Opus verdict: anomaly={opus_analysis.get('anomaly')}", flush=True)
         return opus_analysis
@@ -1184,7 +1646,7 @@ async def handle_fix_request(message, incident: dict):
     )
     thinking = await message.channel.send("⏳ 分析中...")
     try:
-        result, new_session_id = await run_claude(
+        result, new_session_id, _ = await run_claude(
             fix_prompt, worktree_path, status_msg=thinking, channel=message.channel
         )
         if new_session_id:
@@ -1372,7 +1834,7 @@ async def parse_monitor_config(text: str, channel_id: int) -> dict | None:
     )
 
     try:
-        result, _ = await run_claude(analyze_prompt, WORK_ROOT)
+        result, _, _ = await run_claude(analyze_prompt, WORK_ROOT)
         print(f"[MONITOR] Claude analysis raw: {result[:500]}", flush=True)
         cleaned = re.sub(r'```(?:json)?\s*', '', result).strip()
         start = cleaned.find('{')
@@ -1455,7 +1917,7 @@ async def adjust_monitor_config(config: dict, text: str) -> dict:
     )
 
     try:
-        result, _ = await run_claude(adjust_prompt, WORK_ROOT)
+        result, _, _ = await run_claude(adjust_prompt, WORK_ROOT)
         start = result.find('{')
         end = result.rfind('}')
         if start >= 0 and end > start:
@@ -1594,6 +2056,10 @@ HELP_TEXT = """**Twix Bot 指令說明**
 完成後說「做完了」或 `!done`
 `有哪些 task` — 列出進行中的 tasks
 
+**Sprint Plan（大型任務）：**
+`!plan <任務描述>` — 讓 Planner 分析 codebase 並產出執行計畫
+計畫確認後自動分步執行，每步都有 Evaluator 驗收
+
 **Super Manager：**
 `!manager` — 查看所有 thread 的狀態總覽
 `!manager <問題>` — 跨 thread 提問（例如：「erigon 修好了嗎？」「目前什麼最緊急？」）
@@ -1601,7 +2067,7 @@ HELP_TEXT = """**Twix Bot 指令說明**
 **手動指令：**
 `!repo` / `!repo <名稱>` — 查看/切換專案
 `!projects` — 列出所有專案
-`!reset` — 重置對話上下文
+`!reset` — 重置對話上下文（含 debug 紀錄）
 """
 
 
@@ -1714,7 +2180,7 @@ async def on_message(message: discord.Message):
 
         thinking = await message.reply("🧠 Manager 思考中...")
         try:
-            result, _ = await run_claude(ctx, WORK_ROOT, system_prompt=(
+            result, _, _ = await run_claude(ctx, WORK_ROOT, system_prompt=(
                 "你是一個 Discord server 的 Super Manager。你掌握所有 thread 的摘要、監控狀態和進行中的任務。"
                 "根據這些資訊回答用戶的問題。簡潔扼要，用繁體中文回答。"
                 "如果資訊不足以回答，誠實說明。"
@@ -1813,9 +2279,12 @@ async def on_message(message: discord.Message):
         return
 
     if content == "!reset":
-        channel_session[message.channel.id] = None
+        ch_id = message.channel.id
+        channel_session[ch_id] = None
+        channel_cumulative_turns.pop(ch_id, None)
+        channel_debug_context.pop(ch_id, None)
         _save_state()
-        await message.reply("✅ 對話已重置")
+        await message.reply("✅ 對話已重置（debug 紀錄已清除）")
         return
 
     if content.startswith("!thread"):
@@ -1835,6 +2304,78 @@ async def on_message(message: discord.Message):
 
     if content == "!done":
         content = "!task done"
+
+    # ── !plan command ──
+    if content.startswith("!plan"):
+        task_desc = content[5:].strip()
+        if not task_desc:
+            await message.reply("用法：`!plan <任務描述>`\n例如：`!plan 為 ePBS 加上 builder bid 驗證機制`")
+            return
+
+        cwd = channel_workdir.get(message.channel.id, WORK_ROOT)
+        thinking = await message.reply("📋 Planner 分析中...")
+
+        try:
+            plan = await generate_plan(task_desc, cwd)
+            if not plan or not plan.get("steps"):
+                await thinking.edit(content="❌ Planner 無法產生計畫，請提供更具體的任務描述。")
+                return
+
+            display = format_plan_display(plan)
+            pidx = pikmin_assignments.get(message.channel.id, 0)
+            view = PlanView(plan, task_desc, cwd, message.channel, pidx)
+
+            chunks = split_message(display)
+            await thinking.edit(content=chunks[0])
+            for chunk in chunks[1:]:
+                await message.channel.send(chunk)
+            await message.channel.send("請確認計畫：", view=view)
+        except Exception as e:
+            print(f"[PLANNER] ERROR: {e}", flush=True)
+            await thinking.edit(content=f"❌ 計畫產生失敗：{e}")
+        return
+
+    # ── Plan modification (pending_plans) ──
+    if message.channel.id in pending_plans:
+        pending = pending_plans.pop(message.channel.id)
+        modification = content
+        cwd = pending["cwd"]
+        thinking = await message.reply("📋 修改計畫中...")
+
+        try:
+            modify_prompt = (
+                f"以下是原始計畫（JSON）：\n```json\n{json.dumps(pending['plan'], ensure_ascii=False, indent=2)}\n```\n\n"
+                f"用戶要求修改：{modification}\n\n"
+                f"請根據修改要求輸出新的完整 sprint contract JSON。格式跟原本一樣。只輸出 JSON。"
+            )
+            cmd = [
+                "claude", "-p", modify_prompt,
+                "--model", PLANNER_MODEL,
+                "--system-prompt", PLANNER_PROMPT,
+                "--output-format", "stream-json",
+                "--max-turns", "3",
+            ]
+            result, _, _, _ = await _run_claude_stream(cmd, cwd)
+            if result:
+                cleaned = re.sub(r'```(?:json)?\s*', '', result).strip().rstrip('`')
+                start = cleaned.find('{')
+                end = cleaned.rfind('}')
+                if start >= 0 and end > start:
+                    new_plan = json.loads(cleaned[start:end + 1])
+                    display = format_plan_display(new_plan)
+                    view = PlanView(new_plan, pending["task"], cwd, message.channel, pending["pikmin_idx"])
+                    chunks = split_message(display)
+                    await thinking.edit(content=chunks[0])
+                    for chunk in chunks[1:]:
+                        await message.channel.send(chunk)
+                    await message.channel.send("請確認修改後的計畫：", view=view)
+                else:
+                    await thinking.edit(content="❌ 無法解析修改後的計畫。")
+            else:
+                await thinking.edit(content="❌ 修改失敗。")
+        except Exception as e:
+            await thinking.edit(content=f"❌ 修改失敗：{e}")
+        return
 
     if content.startswith("!task"):
         args = content[5:].strip()
@@ -2345,11 +2886,11 @@ async def on_message(message: discord.Message):
             thinking = await message.reply("⏳ 處理中...")
 
         try:
-            result, new_session_id = await run_claude(
+            result, new_session_id, tools_used = await run_claude(
                 enriched_prompt, cwd, session_id, status_msg=thinking, channel=message.channel,
                 system_prompt=monitor_sys_prompt,
             )
-            print(f"[REPLY] result length={len(result)}, session={new_session_id}", flush=True)
+            print(f"[REPLY] result length={len(result)}, session={new_session_id}, tools={len(tools_used)}", flush=True)
             if new_session_id:
                 channel_session[message.channel.id] = new_session_id
                 _save_state()
@@ -2357,8 +2898,23 @@ async def on_message(message: discord.Message):
             if detected:
                 result = f"📂 `{cwd}`\n\n{result}"
 
+            wrote_code = _has_write_tools(tools_used)
+
+            # ── Send generator's response ──
             chunks = split_message(result)
-            print(f"[REPLY] sending {len(chunks)} chunks, first={len(chunks[0])} chars", flush=True)
+            print(f"[REPLY] sending {len(chunks)} chunks, wrote_code={wrote_code}", flush=True)
+
+            # For pure answers, attach review button; for write ops, no button (auto-review below)
+            view = None
+            if not wrote_code and pikmin:
+                view = ReviewView(
+                    user_prompt=prompt,
+                    generator_result=result,
+                    cwd=cwd,
+                    channel=message.channel,
+                    generator_pikmin=pikmin,
+                )
+
             if pikmin:
                 try:
                     await pikmin_edit(thinking, chunks[0], message.channel)
@@ -2367,15 +2923,101 @@ async def on_message(message: discord.Message):
                     await pikmin_send(message.channel, chunks[0], pikmin)
                 for chunk in chunks[1:]:
                     await pikmin_send(message.channel, chunk, pikmin)
+                # Send review button as a separate message (webhooks can't have views)
+                if view:
+                    await message.channel.send("", view=view)
             else:
                 try:
-                    await thinking.edit(content=chunks[0])
+                    await thinking.edit(content=chunks[0], view=view)
                 except Exception as edit_err:
                     print(f"[REPLY] edit failed: {edit_err}, sending as new message", flush=True)
-                    await message.channel.send(chunks[0])
+                    await message.channel.send(chunks[0], view=view)
                 for chunk in chunks[1:]:
                     await message.channel.send(chunk)
             print(f"[REPLY] all chunks sent", flush=True)
+
+            # ── Auto-review for write operations (with dialogue loop) ──
+            if wrote_code and pikmin:
+                print(f"[EVALUATOR] auto-review triggered (write tools detected)", flush=True)
+                eval_pikmin = _pick_eval_pikmin(pikmin)
+                eval_thinking = await pikmin_send(message.channel, "🔍 Review 中...", eval_pikmin)
+                try:
+                    review = await run_evaluator(prompt, result, cwd)
+                    if not review or "FAIL" not in review.upper():
+                        # PASS on first try — just show review
+                        if review:
+                            review_chunks = split_message(review)
+                            try:
+                                await pikmin_edit(eval_thinking, review_chunks[0], message.channel)
+                            except Exception:
+                                await pikmin_send(message.channel, review_chunks[0], eval_pikmin)
+                            for chunk in review_chunks[1:]:
+                                await pikmin_send(message.channel, chunk, eval_pikmin)
+                        else:
+                            await pikmin_edit(eval_thinking, "✅ Review 完成，沒有發現問題。", message.channel)
+                    else:
+                        # FAIL — show review then start dialogue loop
+                        review_chunks = split_message(review)
+                        try:
+                            await pikmin_edit(eval_thinking, review_chunks[0], message.channel)
+                        except Exception:
+                            await pikmin_send(message.channel, review_chunks[0], eval_pikmin)
+                        for chunk in review_chunks[1:]:
+                            await pikmin_send(message.channel, chunk, eval_pikmin)
+
+                        # Resume generator with evaluator feedback for correction rounds
+                        fix_session = new_session_id
+                        for fix_round in range(2, MAX_GEN_EVAL_ROUNDS + 1):
+                            fix_prompt = (
+                                f"Evaluator 的回饋如下，請根據回饋修正：\n\n{review}\n\n"
+                                f"修正完成後說明你改了什麼。"
+                            )
+                            fix_thinking = await pikmin_send(
+                                message.channel, f"🔧 根據回饋修正中... (第 {fix_round}/{MAX_GEN_EVAL_ROUNDS} 輪)", pikmin
+                            )
+                            fix_result, fix_sid, _, _ = await run_claude(
+                                fix_prompt, cwd, session_id=fix_session, status_msg=fix_thinking, channel=message.channel,
+                            )
+                            if fix_sid:
+                                fix_session = fix_sid
+                                channel_session[message.channel.id] = fix_sid
+                                _save_state()
+                            result = fix_result
+
+                            fix_chunks = split_message(fix_result)
+                            try:
+                                await pikmin_edit(fix_thinking, fix_chunks[0], message.channel)
+                            except Exception:
+                                await pikmin_send(message.channel, fix_chunks[0], pikmin)
+                            for chunk in fix_chunks[1:]:
+                                await pikmin_send(message.channel, chunk, pikmin)
+
+                            # Evaluator re-review
+                            re_thinking = await pikmin_send(
+                                message.channel, f"🔍 Re-review 中... (第 {fix_round}/{MAX_GEN_EVAL_ROUNDS} 輪)", eval_pikmin
+                            )
+                            review = await run_evaluator(prompt, fix_result, cwd)
+                            if review:
+                                re_chunks = split_message(review)
+                                try:
+                                    await pikmin_edit(re_thinking, re_chunks[0], message.channel)
+                                except Exception:
+                                    await pikmin_send(message.channel, re_chunks[0], eval_pikmin)
+                                for chunk in re_chunks[1:]:
+                                    await pikmin_send(message.channel, chunk, eval_pikmin)
+                            else:
+                                await pikmin_edit(re_thinking, "✅ 修正後沒有發現問題。", message.channel)
+
+                            if not review or "FAIL" not in review.upper():
+                                break
+                        else:
+                            await message.channel.send(f"⚠️ 經 {MAX_GEN_EVAL_ROUNDS} 輪修正仍有問題，請人工檢查。")
+                except Exception as eval_err:
+                    print(f"[EVALUATOR] ERROR: {eval_err}", flush=True)
+                    try:
+                        await pikmin_edit(eval_thinking, f"⚠️ Review 失敗: {eval_err}", message.channel)
+                    except Exception:
+                        pass
 
             # Update thread summary in background (non-blocking)
             thread_topic = ""
