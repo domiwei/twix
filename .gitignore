@@ -3,3 +3,5 @@ bot.log
 __pycache__/
 .env
 state.json
+monitors.json
+summaries.json

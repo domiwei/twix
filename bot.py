@@ -19,6 +19,21 @@ client = discord.Client(intents=intents)
 PREFIX = "!claude "
 MAX_MSG_LEN = 2000
 
+# ── Pikmin Agent Pool ─────────────────────────────────────────────────────────
+
+PIKMIN_POOL = [
+    {"name": "紅皮", "color": "red", "avatar": "https://pikmin.wiki.gallery/images/5/56/P4_Red_Pikmin.png"},
+    {"name": "藍皮", "color": "blue", "avatar": "https://pikmin.wiki.gallery/images/5/54/P4_Blue_Pikmin.png"},
+    {"name": "黃皮", "color": "yellow", "avatar": "https://pikmin.wiki.gallery/images/8/8d/P4_Yellow_Pikmin.png"},
+    {"name": "紫皮", "color": "purple", "avatar": "https://pikmin.wiki.gallery/images/e/e7/Pikmin_4_Purple_Pikmin.png"},
+    {"name": "白皮", "color": "white", "avatar": "https://pikmin.wiki.gallery/images/f/fc/Pikmin_4_White_Pikmin.png"},
+    {"name": "岩皮", "color": "rock", "avatar": "https://pikmin.wiki.gallery/images/a/a8/P4_Rock_Pikmin.png"},
+    {"name": "翼皮", "color": "winged", "avatar": "https://pikmin.wiki.gallery/images/9/9e/P4_Winged_Pikmin.png"},
+    {"name": "冰皮", "color": "ice", "avatar": "https://pikmin.wiki.gallery/images/8/84/P4_Leaf_Ice_Pikmin_Artwork.png"},
+    {"name": "光皮", "color": "glow", "avatar": "https://pikmin.wiki.gallery/images/0/03/Glow_Pikmin.png"},
+    {"name": "蟲皮", "color": "bulbmin", "avatar": "https://pikmin.wiki.gallery/images/2/2b/Bulbmin_Pikmin_icon.png"},
+]
+
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
 
 SYSTEM_PROMPT = (
@@ -42,10 +57,16 @@ def monitor_system_prompt(config: dict) -> str:
         f"You are '{nickname}', a performance monitoring assistant for the {service_name} service. "
         "You will receive periodic system metrics (CPU, memory, etc.). "
         "Analyze the data and determine if there are anomalies or optimization opportunities. "
-        'Respond in JSON format: {"anomaly": true/false, "summary": "brief description", "details": "detailed analysis"}. '
+        'Respond in JSON format: {"anomaly": true/false, "summary": "brief description", "details": "detailed analysis", "lesson": "optional — new insight learned from this check, or null if nothing new"}. '
+        "The 'lesson' field should capture reusable observations, e.g. 'this service normally uses 80% CPU during sync', "
+        "'log errors about peer disconnection are routine', etc. Only include a lesson when you genuinely learn something new "
+        "that is NOT already in your existing knowledge. Set to null otherwise. "
         "Consider: memory leaks (steady growth), CPU spikes, unusual resource consumption patterns. "
         "Compare with previous readings when available. Be concise. "
-        "Always write your analysis in Traditional Chinese (繁體中文)."
+        "Always write your analysis in Traditional Chinese (繁體中文).\n\n"
+        "When the user asks you to perform operations (restart, deploy, clean data, pull code, etc.), "
+        "and you are not certain WHERE to execute them (local machine vs remote host), "
+        "you MUST ask the user to confirm before executing. Never guess."
     )
 
     if knowledge:
@@ -87,9 +108,10 @@ def _load_state():
         session = {int(k): v for k, v in data.get("session", {}).items()}
         threads = set(int(t) for t in data.get("threads", []))
         worktrees = {int(k): v for k, v in data.get("worktrees", {}).items()}
-        return workdir, session, threads, worktrees
+        pikmin = {int(k): v for k, v in data.get("pikmin", {}).items()}
+        return workdir, session, threads, worktrees, pikmin
     except (FileNotFoundError, json.JSONDecodeError, TypeError):
-        return {}, {}, set(), {}
+        return {}, {}, set(), {}, {}
 
 
 def _save_state():
@@ -98,6 +120,7 @@ def _save_state():
         "session": {str(k): v for k, v in channel_session.items()},
         "threads": list(bot_threads),
         "worktrees": {str(k): v for k, v in channel_worktrees.items()},
+        "pikmin": {str(k): v for k, v in pikmin_assignments.items()},
     }
     with open(STATE_FILE, "w") as f:
         json.dump(data, f)
@@ -121,7 +144,8 @@ def _save_monitors():
         json.dump(data, f, ensure_ascii=False)
 
 
-channel_workdir, channel_session, _loaded_threads, channel_worktrees = _load_state()
+channel_workdir, channel_session, _loaded_threads, channel_worktrees, pikmin_assignments = _load_state()
+# pikmin_assignments: channel_id -> pikmin_index (int) for threads/monitors
 monitor_configs, active_incidents = _load_monitors()
 thread_summaries: dict[str, dict] = _load_summaries()
 
@@ -129,6 +153,8 @@ thread_summaries: dict[str, dict] = _load_summaries()
 active_monitor_tasks: dict[str, asyncio.Task] = {}  # monitor_id -> task
 monitor_histories: dict[str, list[dict]] = {}  # monitor_id -> metric history
 pending_monitors: dict[int, dict] = {}  # channel_id -> pending monitor config
+pending_monitor_setup: set[int] = set()  # channel_ids awaiting monitor description
+pending_monitor_removals: dict[int, dict] = {}  # channel_id -> pending removal info
 channel_session_ts: dict[int, float] = {}  # channel_id -> last session activity timestamp
 _channel_locks: dict[int, asyncio.Lock] = {}  # per-channel lock to prevent concurrent processing
 
@@ -137,6 +163,101 @@ def _get_channel_lock(channel_id: int) -> asyncio.Lock:
     if channel_id not in _channel_locks:
         _channel_locks[channel_id] = asyncio.Lock()
     return _channel_locks[channel_id]
+
+
+# ── Pikmin Webhook Helpers ────────────────────────────────────────────────────
+
+_webhook_cache: dict[int, discord.Webhook] = {}  # parent_channel_id -> webhook
+
+
+async def _get_webhook(channel) -> discord.Webhook:
+    """Get or create a webhook for the channel (or its parent if it's a thread)."""
+    # Resolve to parent channel if this is a thread
+    parent = channel.parent if isinstance(channel, discord.Thread) else channel
+    parent_id = parent.id
+
+    if parent_id in _webhook_cache:
+        return _webhook_cache[parent_id]
+
+    # Check if we already have a webhook
+    try:
+        webhooks = await parent.webhooks()
+        for wh in webhooks:
+            if wh.name == "Pikmin":
+                _webhook_cache[parent_id] = wh
+                return wh
+    except Exception:
+        pass
+
+    # Create new webhook
+    wh = await parent.create_webhook(name="Pikmin")
+    _webhook_cache[parent_id] = wh
+    return wh
+
+
+def _assign_pikmin(channel_id: int, monitor_id: str | None = None) -> int:
+    """Assign a pikmin index to a channel/monitor. Avoids duplicates when possible."""
+    # If monitor has a pikmin already, use it
+    if monitor_id:
+        config = monitor_configs.get(monitor_id, {})
+        if "pikmin_index" in config:
+            return config["pikmin_index"]
+
+    # If channel already has one, reuse
+    if channel_id in pikmin_assignments:
+        return pikmin_assignments[channel_id]
+
+    # Find least-used pikmin
+    used = set(pikmin_assignments.values())
+    for mc in monitor_configs.values():
+        if "pikmin_index" in mc:
+            used.add(mc["pikmin_index"])
+
+    for i in range(len(PIKMIN_POOL)):
+        if i not in used:
+            return i
+
+    # All used, pick round-robin based on total assignments
+    return len(pikmin_assignments) % len(PIKMIN_POOL)
+
+
+def _get_pikmin(channel_id: int) -> dict | None:
+    """Get the pikmin assigned to a channel, or None."""
+    idx = pikmin_assignments.get(channel_id)
+    if idx is not None and 0 <= idx < len(PIKMIN_POOL):
+        return PIKMIN_POOL[idx]
+    return None
+
+
+async def pikmin_send(channel, content: str, pikmin: dict, **kwargs):
+    """Send a message as a pikmin via webhook."""
+    try:
+        wh = await _get_webhook(channel)
+        thread = channel if isinstance(channel, discord.Thread) else discord.utils.MISSING
+        return await wh.send(
+            content,
+            username=pikmin["name"],
+            avatar_url=pikmin["avatar"],
+            thread=thread,
+            wait=True,
+            **kwargs,
+        )
+    except Exception as e:
+        print(f"[PIKMIN] webhook send failed: {e}, falling back to normal send", flush=True)
+        return await channel.send(f"**{pikmin['name']}**: {content}")
+
+
+async def pikmin_edit(message, content: str, channel):
+    """Edit a webhook message."""
+    try:
+        wh = await _get_webhook(channel)
+        thread = channel if isinstance(channel, discord.Thread) else discord.utils.MISSING
+        await wh.edit_message(message.id, content=content, thread=thread)
+    except Exception:
+        try:
+            await message.edit(content=content)
+        except Exception:
+            pass
 
 bot_threads: set[int] = _loaded_threads
 
@@ -161,14 +282,20 @@ def detect_project(text: str) -> str | None:
     return None
 
 
-def split_message(text: str) -> list[str]:
+def split_message(text: str, limit: int = 0) -> list[str]:
+    max_len = limit or MAX_MSG_LEN
     chunks = []
-    while len(text) > MAX_MSG_LEN:
-        split_at = text.rfind("\n", 0, MAX_MSG_LEN)
-        if split_at == -1:
-            split_at = MAX_MSG_LEN
+    while len(text) > max_len:
+        # Try splitting at newline
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at <= 0:
+            # Try splitting at space
+            split_at = text.rfind(" ", 0, max_len)
+        if split_at <= 0:
+            # Hard cut
+            split_at = max_len
         chunks.append(text[:split_at])
-        text = text[split_at:].lstrip("\n")
+        text = text[split_at:].lstrip("\n ")
     if text:
         chunks.append(text)
     return chunks
@@ -191,12 +318,13 @@ INTENT_SYSTEM_PROMPT = """\
 You are an intent classifier for a Discord bot. Given a user message and context, classify the intent.
 
 Available intents:
-- monitor_add: User wants to start monitoring a service (e.g. "監控 erigon", "watch nginx")
-- monitor_remove: User wants to stop monitoring (e.g. "停止監控", "別監控了")
+- monitor_add: User wants to SET UP recurring/continuous monitoring of a service (e.g. "監控 erigon", "watch nginx", "幫我盯著", "定期檢查"). One-time status checks like "看看狀況", "檢查一下", "跑得怎樣" are NOT monitor_add — those are "chat".
+- monitor_remove: User EXPLICITLY wants to stop/remove the monitor itself (e.g. "停止監控", "別監控了", "取消監控", "把監控關掉"). Must mention "監控" or "monitor" explicitly.
 - monitor_list: User wants to see active monitors (e.g. "有哪些監控", "list monitors")
 - monitor_confirm: User confirms a pending monitor setup (e.g. "ok", "好", "確認", "開始吧", "就這樣")
 - monitor_adjust: User wants to change pending monitor settings (e.g. "加 log", "改成每10分鐘", "不用 prometheus")
 - monitor_teach: User wants to teach a monitor something, add knowledge or rules (e.g. "告訴阿鏈...", "阿鏈記一下...", "這個錯誤不重要", "peer disconnected 不用管")
+- monitor_resume: User wants to restart/resume a stopped monitor (e.g. "重啟監控", "恢復監控", "把監控開回來", "resume monitor")
 - monitor_move: User wants to move a monitor's reporting to a different channel (e.g. "阿鏈去 #ops 回報", "把 erigon 監控搬到 #alerts", "monitor 改到 #ops")
 - branch_task: User wants to create a branch/worktree for parallel work (e.g. "開 branch fix/issue-42 在 erigon")
 - task_done: User says a task is complete (e.g. "做完了", "收工", "done")
@@ -209,8 +337,12 @@ Available intents:
 
 Important:
 - If the user is DECLINING an action (e.g. "先不要修", "不用", "別重啟"), classify as "chat", not the action.
+- "關掉吧", "先關掉", "關掉它" etc. referring to the monitored service/process (not the monitor itself) should be classified as "chat", not "monitor_remove". Only classify as "monitor_remove" when the user explicitly mentions stopping the MONITOR/監控 itself.
+- Inside an incident thread, the user is talking about the monitored service, NOT the monitor. Do NOT classify as "monitor_remove" in incident threads — use "chat" instead.
 - monitor_confirm/monitor_adjust only apply when context says there is a pending monitor setup.
 - monitor_teach applies when user talks to a monitor by nickname or wants to teach/tell a monitor something. Context will list active monitor nicknames.
+- When context says "User is replying to monitor ... webhook message", the user is talking TO or ABOUT that monitor, not the underlying service. Classify accordingly (e.g. monitor_resume, monitor_remove, monitor_teach). "restart" is only for restarting the monitored service itself in an incident thread.
+- Asking about a service's status, health, or logs (e.g. "看看狀況", "跑得怎樣", "檢查一下", "process 還活著嗎") is "chat", NOT "monitor_add". Only classify as "monitor_add" when the user clearly wants to set up ongoing/recurring monitoring.
 - If unsure, default to "chat".
 
 Respond with ONLY a JSON object: {"intent": "<intent_name>"}"""
@@ -250,19 +382,35 @@ async def classify_intent(text: str, context: str = "") -> str:
                 return "chat"
 
             # Parse — could be wrapped in Claude JSON envelope
+            print(f"[INTENT] raw response: {raw[:300]}", flush=True)
             data = json.loads(raw)
+
+            def _extract_intent(result_text: str) -> str:
+                """Extract intent from result text, handling markdown code blocks."""
+                if not result_text:
+                    return "chat"
+                # Strip markdown code blocks
+                cleaned = re.sub(r'```(?:json)?\s*', '', result_text).strip()
+                try:
+                    inner = json.loads(cleaned)
+                    return inner.get("intent", "chat")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+                # Try to find JSON inside the text
+                jm = re.search(r'\{[^}]*"intent"\s*:\s*"([^"]+)"', result_text)
+                if jm:
+                    return jm.group(1)
+                return "chat"
+
             if isinstance(data, list):
                 for entry in data:
                     if isinstance(entry, dict) and entry.get("type") == "result":
-                        result_text = entry.get("result", "")
-                        inner = json.loads(result_text)
-                        intent = inner.get("intent", "chat")
+                        intent = _extract_intent(entry.get("result", ""))
                         print(f"[INTENT] '{text[:50]}' -> {intent}", flush=True)
                         return intent
             elif isinstance(data, dict):
                 if "result" in data:
-                    inner = json.loads(data["result"])
-                    intent = inner.get("intent", "chat")
+                    intent = _extract_intent(data["result"])
                     print(f"[INTENT] '{text[:50]}' -> {intent}", flush=True)
                     return intent
                 if "intent" in data:
@@ -634,7 +782,7 @@ def build_cross_thread_context(current_channel_id: int) -> str:
 # ── Monitoring System ────────────────────────────────────────────────────────
 
 def collect_metrics(config: dict) -> str:
-    """Collect metrics based on monitor config."""
+    """Collect metrics based on monitor config. Works for both local and remote targets."""
     service = config["service_name"]
     lines = [f"=== {service} Metrics @ {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"]
 
@@ -699,6 +847,39 @@ def collect_metrics(config: dict) -> str:
     return "\n".join(lines)
 
 
+async def collect_metrics_via_claude(config: dict) -> str:
+    """Use Claude to collect metrics for flexible/remote monitors."""
+    instruction = config.get("check_instruction", "")
+    check_commands = config.get("check_commands", "")
+    checks = config.get("checks", ["cpu", "memory"])
+    service = config["service_name"]
+    knowledge = config.get("knowledge", [])
+
+    prompt = (
+        f"你是 {service} 的監控助手。請執行以下檢查並回傳結果。\n"
+        f"監控描述：{instruction}\n"
+        f"檢查項目：{', '.join(checks)}\n"
+    )
+    if check_commands:
+        prompt += f"檢查方式：{check_commands}\n"
+    if config.get("log_path"):
+        prompt += f"Log 路徑：{config['log_path']}\n"
+    if knowledge:
+        prompt += "已知規則：\n" + "\n".join(f"- {k}" for k in knowledge) + "\n"
+    prompt += (
+        "\n請直接執行必要的指令（SSH、curl 等）收集數據，然後用以下格式回傳：\n"
+        "1. 每個檢查項目的數值\n"
+        "2. 是否有異常\n"
+        "保持簡潔，只回傳數據和判斷。"
+    )
+
+    result, _ = await run_claude(
+        prompt, config.get("project_path", WORK_ROOT),
+        system_prompt=monitor_system_prompt(config),
+    )
+    return f"=== {service} Metrics @ {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n{result}"
+
+
 def quick_threshold_check(metrics: str) -> dict | None:
     """Fast Python-based threshold check. Returns anomaly info or None."""
     # Extract CPU % from ps output
@@ -726,6 +907,35 @@ def quick_threshold_check(metrics: str) -> dict | None:
     return None
 
 
+MAX_KNOWLEDGE = 50  # cap to prevent unbounded growth
+
+
+def _maybe_learn(config: dict, analysis: dict) -> str | None:
+    """Extract and store a lesson from Claude's analysis, if any."""
+    lesson = analysis.get("lesson")
+    if not lesson or lesson == "null":
+        return None
+    lesson = str(lesson).strip()
+    if not lesson:
+        return None
+    knowledge = config.setdefault("knowledge", [])
+    # Skip if too similar to existing knowledge
+    for existing in knowledge:
+        if lesson in existing or existing in lesson:
+            return None
+    if len(knowledge) >= MAX_KNOWLEDGE:
+        # Remove oldest non-user-taught lesson
+        for i, k in enumerate(knowledge):
+            if k.startswith("自動學習："):
+                knowledge.pop(i)
+                break
+        else:
+            return None  # all are user-taught, don't evict
+    knowledge.append(f"自動學習：{lesson}")
+    _save_monitors()
+    return lesson
+
+
 def find_incident_by_thread(thread_id: int) -> dict | None:
     """Find an active incident by its thread ID."""
     for inc in active_incidents.values():
@@ -748,7 +958,9 @@ async def create_incident(monitor_id: str, channel, analysis_summary: str, analy
     inc_id = f"inc_{uuid.uuid4().hex[:8]}"
 
     nickname = config.get("nickname", config["name"])
-    alert_msg = await channel.send(f"⚠️ **{nickname} 監控偵測到異常**")
+    pidx = config.get("pikmin_index", 0)
+    pikmin = PIKMIN_POOL[pidx % len(PIKMIN_POOL)]
+    alert_msg = await pikmin_send(channel, f"⚠️ **{nickname} 監控偵測到異常**", pikmin)
     thread = await alert_msg.create_thread(
         name=f"🚨 {nickname} 異常 - {time.strftime('%m/%d %H:%M')}"
     )
@@ -771,8 +983,8 @@ async def create_incident(monitor_id: str, channel, analysis_summary: str, analy
 
     chunks = split_message(f"**{analysis_summary}**\n\n{analysis_details}")
     for chunk in chunks:
-        await thread.send(chunk)
-    await thread.send("如果要修，說「修吧」，我會開 branch 來處理。")
+        await pikmin_send(thread, chunk, pikmin)
+    await pikmin_send(thread, "如果要修，說「修吧」，我會開 branch 來處理。", pikmin)
 
     return incident
 
@@ -781,7 +993,10 @@ async def resolve_incident(incident: dict):
     """Resolve an incident and archive the thread."""
     thread = client.get_channel(incident["thread_id"])
     if thread:
-        await thread.send("✅ 連續多次檢查正常，問題已解決。關閉此 thread。")
+        config = monitor_configs.get(incident.get("monitor_id"), {})
+        pidx = config.get("pikmin_index", 0)
+        pikmin = PIKMIN_POOL[pidx % len(PIKMIN_POOL)]
+        await pikmin_send(thread, "✅ 連續多次檢查正常，問題已解決。關閉此 thread。", pikmin)
         try:
             await thread.edit(archived=True)
         except Exception:
@@ -893,15 +1108,26 @@ async def monitor_loop(monitor_id: str, channel):
     nickname = config.get("nickname", config["name"])
     display = f"{nickname} ({config['name']})" if nickname != config["name"] else config["name"]
     knowledge_count = len(config.get("knowledge", []))
+    pidx = config.get("pikmin_index", 0)
+    pikmin = PIKMIN_POOL[pidx % len(PIKMIN_POOL)]
     startup_msg = f"📊 **{display}** 監控已啟動\n每 {check_interval // 60} 分鐘檢查，每 {summary_interval // 3600} 小時回報狀態。"
     if knowledge_count:
         startup_msg += f"\n🧠 已載入 {knowledge_count} 條知識"
-    await channel.send(startup_msg)
+    await pikmin_send(channel, startup_msg, pikmin)
+
+    # Determine if this monitor needs Claude to collect metrics
+    # If check_commands exists, always use Claude (it was generated by Claude's analysis)
+    use_claude_collect = bool(config.get("check_commands"))
 
     while True:
         await asyncio.sleep(check_interval)
         try:
-            metrics = collect_metrics(config)
+            if use_claude_collect:
+                # Flexible monitor: let Claude collect and analyze
+                metrics = await collect_metrics_via_claude(config)
+            else:
+                # Local project monitor: use fast local collection
+                metrics = collect_metrics(config)
 
             # Keep history
             history = monitor_histories.setdefault(monitor_id, [])
@@ -909,69 +1135,136 @@ async def monitor_loop(monitor_id: str, channel):
             if len(history) > 36:  # ~3 hours at 5-min intervals
                 monitor_histories[monitor_id] = history[-36:]
 
-            # Quick threshold check first (free, no Claude call)
-            threshold_hit = quick_threshold_check(metrics)
-
             open_incident = find_incident_by_monitor(monitor_id)
 
-            if threshold_hit:
-                # Threshold hit — call Claude for detailed analysis
+            if use_claude_collect:
+                # Claude already analyzed — ask it to judge anomaly
                 history_text = "\n\n".join(
                     f"--- {h['time']} ---\n{h['data']}"
-                    for h in monitor_histories[monitor_id][-6:]
+                    for h in monitor_histories[monitor_id][-3:]
                 )
-                prompt = (
-                    f"以下是 {config['name']} 的歷史 metrics（最新在最下面）：\n\n{history_text}\n\n"
-                    f"快速檢查發現：{threshold_hit['msg']}\n請詳細分析是否有異常及建議。"
+                judge_prompt = (
+                    f"根據以下最近的監控數據，判斷是否有異常。\n\n{history_text}\n\n"
+                    '回覆 JSON: {"anomaly": true/false, "summary": "簡短描述", "details": "詳細分析"}'
                 )
                 result, _ = await run_claude(
-                    prompt, config.get("project_path", WORK_ROOT),
+                    judge_prompt, config.get("project_path", WORK_ROOT),
                     system_prompt=monitor_system_prompt(config),
                 )
-
-                # Parse Claude response
-                summary = threshold_hit["msg"]
-                details = result
+                # Strip markdown code blocks before parsing
+                cleaned = re.sub(r'```(?:json)?\s*', '', result).strip()
                 try:
-                    analysis = json.loads(result)
-                    summary = analysis.get("summary", summary)
-                    details = analysis.get("details", details)
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-                if open_incident:
-                    # Update existing incident thread
-                    open_incident["consecutive_ok"] = 0
-                    thread = client.get_channel(open_incident["thread_id"])
-                    if thread:
-                        update_text = f"📊 **持續異常** ({time.strftime('%H:%M')})\n{summary}\n\n{details}"
-                        for chunk in split_message(update_text):
-                            await thread.send(chunk)
-                else:
-                    # New incident
-                    try:
-                        await create_incident(monitor_id, channel, summary, details)
-                    except Exception as e:
-                        print(f"[MONITOR] Failed to create incident: {e}", flush=True)
-
-                consecutive_ok_for_summary = 0
-
-            else:
-                # Normal
-                consecutive_ok_for_summary += 1
-
-                if open_incident:
-                    open_incident["consecutive_ok"] = open_incident.get("consecutive_ok", 0) + 1
-                    if open_incident["consecutive_ok"] >= 3:
-                        await resolve_incident(open_incident)
+                    start = cleaned.find('{')
+                    end = cleaned.rfind('}')
+                    if start >= 0 and end > start:
+                        analysis = json.loads(cleaned[start:end + 1])
                     else:
+                        analysis = json.loads(cleaned)
+                    is_anomaly = analysis.get("anomaly", False)
+                    summary = analysis.get("summary", "異常")
+                    details = analysis.get("details", result)
+                    _maybe_learn(config, analysis)
+                except (json.JSONDecodeError, TypeError):
+                    # If Claude didn't return JSON, check for keywords
+                    is_anomaly = any(w in result.lower() for w in ("異常", "anomaly", "error", "critical", "warning"))
+                    summary = result[:200]
+                    details = result
+
+                if is_anomaly:
+                    if open_incident:
+                        open_incident["consecutive_ok"] = 0
                         thread = client.get_channel(open_incident["thread_id"])
                         if thread:
-                            await thread.send(
-                                f"📊 檢查正常 ({open_incident['consecutive_ok']}/3)，"
-                                f"連續 3 次正常就自動關閉。"
-                            )
-                    _save_monitors()
+                            update_text = f"📊 **持續異常** ({time.strftime('%H:%M')})\n{summary}\n\n{details}"
+                            for chunk in split_message(update_text):
+                                await pikmin_send(thread, chunk, pikmin)
+                    else:
+                        try:
+                            await create_incident(monitor_id, channel, summary, details)
+                        except Exception as e:
+                            print(f"[MONITOR] Failed to create incident: {e}", flush=True)
+                    consecutive_ok_for_summary = 0
+                else:
+                    consecutive_ok_for_summary += 1
+                    if open_incident:
+                        open_incident["consecutive_ok"] = open_incident.get("consecutive_ok", 0) + 1
+                        if open_incident["consecutive_ok"] >= 3:
+                            await resolve_incident(open_incident)
+                        else:
+                            thread = client.get_channel(open_incident["thread_id"])
+                            if thread:
+                                await pikmin_send(thread,
+                                    f"📊 檢查正常 ({open_incident['consecutive_ok']}/3)，"
+                                    f"連續 3 次正常就自動關閉。",
+                                    pikmin)
+                        _save_monitors()
+            else:
+                # Local monitor: quick threshold check (free, no Claude call)
+                threshold_hit = quick_threshold_check(metrics)
+
+                if threshold_hit:
+                    # Threshold hit — call Claude for detailed analysis
+                    history_text = "\n\n".join(
+                        f"--- {h['time']} ---\n{h['data']}"
+                        for h in monitor_histories[monitor_id][-6:]
+                    )
+                    prompt = (
+                        f"以下是 {config['name']} 的歷史 metrics（最新在最下面）：\n\n{history_text}\n\n"
+                        f"快速檢查發現：{threshold_hit['msg']}\n請詳細分析是否有異常及建議。"
+                    )
+                    result, _ = await run_claude(
+                        prompt, config.get("project_path", WORK_ROOT),
+                        system_prompt=monitor_system_prompt(config),
+                    )
+
+                    # Parse Claude response
+                    summary = threshold_hit["msg"]
+                    details = result
+                    cleaned_result = re.sub(r'```(?:json)?\s*', '', result).strip()
+                    try:
+                        rs = cleaned_result.find('{')
+                        re_ = cleaned_result.rfind('}')
+                        if rs >= 0 and re_ > rs:
+                            analysis = json.loads(cleaned_result[rs:re_ + 1])
+                        else:
+                            analysis = json.loads(cleaned_result)
+                        summary = analysis.get("summary", summary)
+                        details = analysis.get("details", details)
+                        _maybe_learn(config, analysis)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                    if open_incident:
+                        open_incident["consecutive_ok"] = 0
+                        thread = client.get_channel(open_incident["thread_id"])
+                        if thread:
+                            update_text = f"📊 **持續異常** ({time.strftime('%H:%M')})\n{summary}\n\n{details}"
+                            for chunk in split_message(update_text):
+                                await pikmin_send(thread, chunk, pikmin)
+                    else:
+                        try:
+                            await create_incident(monitor_id, channel, summary, details)
+                        except Exception as e:
+                            print(f"[MONITOR] Failed to create incident: {e}", flush=True)
+
+                    consecutive_ok_for_summary = 0
+
+                else:
+                    # Normal
+                    consecutive_ok_for_summary += 1
+
+                    if open_incident:
+                        open_incident["consecutive_ok"] = open_incident.get("consecutive_ok", 0) + 1
+                        if open_incident["consecutive_ok"] >= 3:
+                            await resolve_incident(open_incident)
+                        else:
+                            thread = client.get_channel(open_incident["thread_id"])
+                            if thread:
+                                await pikmin_send(thread,
+                                    f"📊 檢查正常 ({open_incident['consecutive_ok']}/3)，"
+                                    f"連續 3 次正常就自動關閉。",
+                                    pikmin)
+                        _save_monitors()
 
             # Periodic summary
             now = time.time()
@@ -988,13 +1281,20 @@ async def monitor_loop(monitor_id: str, channel):
                     summary_text += f"⚠️ 有 {active_count} 個未解決的 incident\n"
                 else:
                     summary_text += "✅ 一切正常\n"
-                await channel.send(summary_text)
+                await pikmin_send(channel, summary_text, pikmin)
 
-            print(
-                f"[MONITOR] {config['name']} {time.strftime('%H:%M:%S')} - "
-                f"{'ANOMALY' if threshold_hit else 'OK'}",
-                flush=True,
-            )
+            if use_claude_collect:
+                print(
+                    f"[MONITOR] {config['name']} {time.strftime('%H:%M:%S')} - "
+                    f"{'ANOMALY' if is_anomaly else 'OK'}",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[MONITOR] {config['name']} {time.strftime('%H:%M:%S')} - "
+                    f"{'ANOMALY' if threshold_hit else 'OK'}",
+                    flush=True,
+                )
 
         except asyncio.CancelledError:
             raise
@@ -1002,116 +1302,142 @@ async def monitor_loop(monitor_id: str, channel):
             print(f"[MONITOR] {config['name']} Error: {e}", flush=True)
 
 
-def parse_monitor_config(text: str, channel_id: int) -> dict | None:
-    """Parse natural language into a monitor config."""
+async def parse_monitor_config(text: str, channel_id: int) -> dict | None:
+    """Parse natural language into a monitor config using Claude for analysis."""
     project = detect_project(text)
-    if not project:
+    project_path = os.path.join(WORK_ROOT, project) if project else WORK_ROOT
+
+    # Let Claude analyze everything
+    analyze_prompt = (
+        f"使用者想建立一個監控：「{text}」\n\n"
+        "請分析這個需求並回覆 JSON（不要有其他文字）：\n"
+        "{\n"
+        '  "name": "簡短的監控名稱，例如 erigon、gloas-spec-monitor",\n'
+        '  "nickname": "使用者指定的暱稱，如果沒有就跟 name 一樣",\n'
+        '  "checks": ["要檢查的項目，例如 cpu, memory, log, sync, disk, http, port, process, github, custom"],\n'
+        '  "check_interval_min": 檢查頻率（分鐘，預設5）,\n'
+        '  "summary_interval_hour": 定期回報間隔（小時，預設3）,\n'
+        '  "check_commands": "具體的檢查指令說明，例如：SSH 到 X 執行 Y、curl Z、gh api 等",\n'
+        '  "log_path": "log路徑或null",\n'
+        '  "prometheus_url": "prometheus URL或null"\n'
+        "}\n\n"
+        "根據使用者的描述推斷合理的檢查項目和方式。如果提到遠端機器，check_commands 要包含 SSH 指令。"
+        "如果提到 GitHub repo，check_commands 要包含 gh api 或 curl GitHub API 的指令。"
+    )
+
+    try:
+        result, _ = await run_claude(analyze_prompt, WORK_ROOT)
+        print(f"[MONITOR] Claude analysis raw: {result[:500]}", flush=True)
+        cleaned = re.sub(r'```(?:json)?\s*', '', result).strip()
+        start = cleaned.find('{')
+        end = cleaned.rfind('}')
+        if start >= 0 and end > start:
+            analysis = json.loads(cleaned[start:end + 1])
+        else:
+            analysis = json.loads(cleaned)
+        print(f"[MONITOR] Parsed analysis: {analysis}", flush=True)
+    except Exception as e:
+        print(f"[MONITOR] Analysis parse failed: {e}", flush=True)
         return None
 
-    project_path = os.path.join(WORK_ROOT, project)
+    name = analysis.get("name", f"monitor-{uuid.uuid4().hex[:6]}")
+    nickname = analysis.get("nickname", name)
+    checks = analysis.get("checks", ["custom"])
 
-    # Detect checks from text
-    checks = []
-    text_lower = text.lower()
-    if any(w in text_lower for w in ("cpu", "效能", "performance")):
-        checks.append("cpu")
-    if any(w in text_lower for w in ("memory", "mem", "記憶體", "內存")):
-        checks.append("memory")
-    if any(w in text_lower for w in ("log", "日誌", "錯誤")):
-        checks.append("log")
+    try:
+        check_interval = int(analysis.get("check_interval_min", 5)) * 60
+    except (TypeError, ValueError):
+        check_interval = 300
+    try:
+        summary_interval = int(analysis.get("summary_interval_hour", 3)) * 3600
+    except (TypeError, ValueError):
+        summary_interval = 10800
 
-    # Default: cpu + memory
-    if not checks:
-        checks = ["cpu", "memory"]
-
-    # Detect intervals
-    check_interval = 300  # default 5 min
-    summary_interval = 10800  # default 3 hours
-
-    # Parse "每X分鐘"
-    interval_match = re.search(r"每\s*(\d+)\s*分鐘", text)
-    if interval_match:
-        check_interval = int(interval_match.group(1)) * 60
-
-    # Detect log path
-    log_path = None
-    log_match = re.search(r"log[^\s]*\s+(\S+\.log)", text, re.IGNORECASE)
-    if log_match:
-        log_path = log_match.group(1)
-
-    # Detect prometheus URL
-    prom_url = None
-    prom_match = re.search(r"(https?://\S+)", text)
-    if prom_match:
-        prom_url = prom_match.group(1)
-
-    # Detect nickname: "叫他阿鏈" / "叫做阿鏈" / "nickname 阿鏈"
-    nickname = None
-    nick_match = re.search(r"(?:叫[他她它]?|叫做|暱稱|nickname)\s*(\S+)", text)
-    if nick_match:
-        nickname = nick_match.group(1).strip("，。、")
+    log_path = analysis.get("log_path")
+    if not log_path or log_path == "null":
+        log_path = None
+    prom_url = analysis.get("prometheus_url")
+    if not prom_url or prom_url == "null":
+        prom_url = None
+    check_commands = analysis.get("check_commands", "")
 
     mid = f"m_{uuid.uuid4().hex[:8]}"
     return {
         "id": mid,
-        "name": project,
-        "nickname": nickname or project,
+        "name": name,
+        "nickname": nickname,
         "channel_id": channel_id,
         "check_interval": check_interval,
         "summary_interval": summary_interval,
         "checks": checks,
-        "service_name": project,
+        "service_name": name,
         "log_path": log_path,
         "prometheus_url": prom_url,
         "project_path": project_path,
+        "check_instruction": text,
+        "check_commands": check_commands,
         "knowledge": [],
         "enabled": True,
     }
 
 
-def adjust_monitor_config(config: dict, text: str) -> dict:
-    """Adjust a pending monitor config based on user feedback."""
-    text_lower = text.lower()
+async def adjust_monitor_config(config: dict, text: str) -> dict:
+    """Adjust a pending monitor config based on user feedback using Claude."""
+    # Use Claude to understand the adjustment
+    current = json.dumps({
+        "checks": config.get("checks", []),
+        "check_interval_min": config.get("check_interval", 300) // 60,
+        "summary_interval_hour": config.get("summary_interval", 10800) // 3600,
+        "check_commands": config.get("check_commands", ""),
+        "log_path": config.get("log_path"),
+        "nickname": config.get("nickname", config.get("name")),
+    }, ensure_ascii=False, indent=2)
 
-    # Add/remove checks
-    if any(w in text_lower for w in ("加 log", "加log", "加上 log", "log", "日誌")):
-        if "log" not in config["checks"]:
-            config["checks"].append("log")
-    if any(w in text_lower for w in ("加 cpu", "加cpu")):
-        if "cpu" not in config["checks"]:
-            config["checks"].append("cpu")
-    if any(w in text_lower for w in ("加 memory", "加mem", "加記憶體")):
-        if "memory" not in config["checks"]:
-            config["checks"].append("memory")
-    if any(w in text_lower for w in ("不用 log", "不要 log", "拿掉 log", "移除 log")):
-        config["checks"] = [c for c in config["checks"] if c != "log"]
-    if any(w in text_lower for w in ("不用 cpu", "不要 cpu", "拿掉 cpu")):
-        config["checks"] = [c for c in config["checks"] if c != "cpu"]
+    adjust_prompt = (
+        f"目前的監控設定：\n{current}\n\n"
+        f"使用者的調整要求：「{text}」\n\n"
+        "請根據使用者的要求修改設定，回覆完整的 JSON（不要有其他文字）：\n"
+        "{\n"
+        '  "checks": [...],\n'
+        '  "check_interval_min": 數字,\n'
+        '  "summary_interval_hour": 數字,\n'
+        '  "check_commands": "更新後的檢查方式",\n'
+        '  "log_path": "路徑或null",\n'
+        '  "nickname": "暱稱"\n'
+        "}\n"
+        "只修改使用者要求改的部分，其他保持不變。"
+    )
 
-    # Adjust interval
-    interval_match = re.search(r"(?:每|改成?\s*每?)\s*(\d+)\s*分鐘", text)
-    if interval_match:
-        config["check_interval"] = int(interval_match.group(1)) * 60
+    try:
+        result, _ = await run_claude(adjust_prompt, WORK_ROOT)
+        start = result.find('{')
+        end = result.rfind('}')
+        if start >= 0 and end > start:
+            updates = json.loads(result[start:end + 1])
+        else:
+            updates = json.loads(result)
 
-    # Adjust summary interval
-    summary_match = re.search(r"(?:每|改成?\s*每?)\s*(\d+)\s*小時.*(?:回報|報告|summary)", text)
-    if summary_match:
-        config["summary_interval"] = int(summary_match.group(1)) * 3600
-
-    # Detect log path
-    log_match = re.search(r"(\S+\.log)\b", text)
-    if log_match:
-        config["log_path"] = log_match.group(1)
-
-    # Detect prometheus URL
-    prom_match = re.search(r"(https?://\S+)", text)
-    if prom_match:
-        config["prometheus_url"] = prom_match.group(1)
-
-    # Adjust nickname
-    nick_match = re.search(r"(?:叫[他她它]?|叫做|改名|暱稱|nickname)\s*(\S+)", text)
-    if nick_match:
-        config["nickname"] = nick_match.group(1).strip("，。、")
+        if "checks" in updates:
+            config["checks"] = updates["checks"]
+        if "check_interval_min" in updates:
+            config["check_interval"] = int(updates["check_interval_min"]) * 60
+        if "summary_interval_hour" in updates:
+            config["summary_interval"] = int(updates["summary_interval_hour"]) * 3600
+        if "check_commands" in updates:
+            config["check_commands"] = updates["check_commands"]
+        if "log_path" in updates and updates["log_path"] != "null":
+            config["log_path"] = updates["log_path"]
+        if "nickname" in updates:
+            config["nickname"] = updates["nickname"]
+    except Exception as e:
+        print(f"[MONITOR] adjust error: {e}", flush=True)
+        # Fallback: simple keyword adjustments
+        nick_match = re.search(r"(?:叫[他她它]?|叫做|改名|暱稱|nickname)\s*(\S+)", text)
+        if nick_match:
+            config["nickname"] = nick_match.group(1).strip("，。、")
+        interval_match = re.search(r"(?:每|改成?\s*每?)\s*(\d+)\s*分鐘", text)
+        if interval_match:
+            config["check_interval"] = int(interval_match.group(1)) * 60
 
     return config
 
@@ -1126,6 +1452,16 @@ def _find_monitor_by_text(text: str) -> dict | None:
             return config
         if name and name in text_lower:
             return config
+    return None
+
+
+def _find_monitor_by_pikmin_name(pikmin_name: str) -> dict | None:
+    """Find a monitor config by its assigned pikmin's display name."""
+    for config in monitor_configs.values():
+        pidx = config.get("pikmin_index")
+        if pidx is not None and 0 <= pidx < len(PIKMIN_POOL):
+            if PIKMIN_POOL[pidx]["name"] == pikmin_name:
+                return config
     return None
 
 
@@ -1167,6 +1503,11 @@ def format_monitor_proposal(config: dict) -> str:
         lines.append(f"  Log 路徑：`{config['log_path']}`")
     if config.get("prometheus_url"):
         lines.append(f"  Prometheus：`{config['prometheus_url']}`")
+    if config.get("check_commands"):
+        lines.append(f"  檢查方式：{config['check_commands']}")
+    # Show if this is a flexible (Claude-powered) monitor
+    if config.get("check_instruction") and not detect_project(config.get("check_instruction", "")):
+        lines.append(f"  模式：🤖 Claude 自動收集（支援 SSH、curl 等）")
     knowledge = config.get("knowledge", [])
     if knowledge:
         lines.append(f"  已累積知識：{len(knowledge)} 條")
@@ -1189,10 +1530,10 @@ HELP_TEXT = """**Twix Bot 指令說明**
 直接在訊息中提到專案名稱，Bot 會自動切換到對應目錄
 
 **監控：**
-`@bot 監控 erigon 叫他阿鏈` — 開始監控，給暱稱
-`@bot 監控 erigon 的 CPU/memory 和 log` — 指定檢查項目
-`列出監控` — 查看所有監控
-`停止監控 erigon` — 停止指定監控
+`!monitor <描述>` — 建立監控（任意目標，不限本地專案）
+`!monitor` — 列出所有監控
+`@bot 監控 erigon 叫他阿鏈` — 用自然語言開始監控
+`列出監控` / `停止監控 erigon` — 管理監控
 
 **教 Monitor：**
 `告訴阿鏈，peer disconnected 偶爾出現是正常的` — 累積知識
@@ -1246,6 +1587,8 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author == client.user:
         return
+    if message.webhook_id:
+        return
 
     content = message.content.strip()
     print(f"[MSG] {message.author}: {content}", flush=True)
@@ -1254,6 +1597,22 @@ async def on_message(message: discord.Message):
 
     if content == "!help":
         await message.reply(HELP_TEXT)
+        return
+
+    # Handle pending monitor setup (user sent !monitor alone, now sending description)
+    if message.channel.id in pending_monitor_setup and not content.startswith("!"):
+        pending_monitor_setup.discard(message.channel.id)
+        thinking = await message.reply("🔍 分析監控需求中...")
+        config = await parse_monitor_config(content, message.channel.id)
+        if not config:
+            await thinking.edit(content="❌ 找不到監控目標。請描述要監控什麼，例如：`!monitor 監控 erigon 的 CPU 和 memory`")
+            return
+        for existing in monitor_configs.values():
+            if existing["name"] == config["name"] and existing.get("enabled"):
+                await thinking.edit(content=f"📊 **{config['name']}** 已經在監控中了。")
+                return
+        pending_monitors[message.channel.id] = config
+        await thinking.edit(content=format_monitor_proposal(config))
         return
 
     if content.startswith("!manager"):
@@ -1322,6 +1681,63 @@ async def on_message(message: discord.Message):
             await thinking.edit(content=f"❌ Error: {e}")
         return
 
+    if content.startswith("!monitor"):
+        args = content[8:].strip()
+        if args == "list":
+            # Explicit list command
+            pass  # fall through to list below
+        elif args:
+            # Has description — create monitor
+            thinking = await message.reply("🔍 分析監控需求中...")
+            try:
+                config = await parse_monitor_config(args, message.channel.id)
+                if not config:
+                    await thinking.edit(content="❌ 請描述要監控什麼，例如：`!monitor erigon 的 CPU 和 memory`")
+                    return
+                for existing in monitor_configs.values():
+                    if existing["name"] == config["name"] and existing.get("enabled"):
+                        await thinking.edit(content=f"📊 **{config['name']}** 已經在監控中了。")
+                        return
+                pending_monitors[message.channel.id] = config
+                await thinking.edit(content=format_monitor_proposal(config))
+            except Exception as e:
+                print(f"[MONITOR] parse error: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+                await thinking.edit(content=f"❌ 分析監控需求時出錯：{e}")
+            return
+        else:
+            # No args — if monitors exist, list them; otherwise prompt for description
+            if monitor_configs:
+                pass  # fall through to list below
+            else:
+                # Mark this channel as awaiting monitor description
+                pending_monitor_setup.add(message.channel.id)
+                await message.reply("📝 請描述你想監控什麼，例如：\n• `監控 hoodi 的 process 狀況`\n• `每 10 分鐘檢查 https://example.com 是否正常`")
+                return
+        # List monitors
+        if not monitor_configs:
+            await message.reply("目前沒有設定任何監控。用 `!monitor <描述>` 建立一個。")
+        else:
+            lines = ["📊 **監控列表：**"]
+            for mid, config in monitor_configs.items():
+                running = mid in active_monitor_tasks and not active_monitor_tasks[mid].done()
+                nickname = config.get("nickname", config["name"])
+                display = f"{nickname} ({config['name']})" if nickname != config["name"] else config["name"]
+                status = "✅ 運行中" if running else "⏹ 已停止"
+                inc = find_incident_by_monitor(mid)
+                if inc:
+                    status += f" ⚠️ incident: {inc['status']}"
+                knowledge_count = len(config.get("knowledge", []))
+                knowledge_info = f" / 🧠 {knowledge_count} 條知識" if knowledge_count else ""
+                lines.append(
+                    f"• **{display}** — {status}\n"
+                    f"  檢查：{', '.join(config.get('checks', []))} / "
+                    f"每 {config.get('check_interval', 300) // 60} 分鐘{knowledge_info}"
+                )
+            await message.reply("\n".join(lines))
+        return
+
     if content == "!projects":
         projects = list_projects()
         if projects:
@@ -1362,8 +1778,11 @@ async def on_message(message: discord.Message):
             thread = await message.create_thread(name=topic)
             bot_threads.add(thread.id)
             channel_workdir[thread.id] = channel_workdir.get(message.channel.id, WORK_ROOT)
-            await thread.send(f"🧵 Thread 已建立！直接在這裡打字就能跟我對話。\n工作目錄：`{channel_workdir[thread.id]}`")
+            pidx = _assign_pikmin(thread.id)
+            pikmin_assignments[thread.id] = pidx
+            pikmin = PIKMIN_POOL[pidx]
             _save_state()
+            await pikmin_send(thread, f"🧵 Thread 已建立！我是 **{pikmin['name']}**，由我來負責。\n工作目錄：`{channel_workdir[thread.id]}`", pikmin)
         except Exception as e:
             await message.reply(f"❌ 無法建立 thread: {e}")
         return
@@ -1428,12 +1847,15 @@ async def on_message(message: discord.Message):
             channel_worktrees[thread.id] = {
                 "repo": repo_path, "worktree": worktree_path, "branch": branch_name,
             }
+            pidx = _assign_pikmin(thread.id)
+            pikmin_assignments[thread.id] = pidx
+            pikmin = PIKMIN_POOL[pidx]
             _save_state()
-            await status.edit(content=f"✅ Task 已建立！\n📂 Worktree: `{worktree_path}`\n🌿 Branch: `{branch_name}`")
-            await thread.send(
+            await status.edit(content=f"✅ Task 已建立！由 **{pikmin['name']}** 負責\n📂 Worktree: `{worktree_path}`\n🌿 Branch: `{branch_name}`")
+            await pikmin_send(thread,
                 f"🔧 **Task: {description}**\n📂 工作目錄：`{worktree_path}`\n🌿 Branch：`{branch_name}`\n\n"
-                f"直接在這裡打字開始工作。完成後說「做完了」或 `!done`。"
-            )
+                f"我是 **{pikmin['name']}**，直接在這裡打字開始工作。完成後說「做完了」或 `!done`。",
+                pikmin)
         except Exception as e:
             await remove_worktree(repo_path, worktree_path)
             await status.edit(content=f"❌ 建立 thread 失敗：{e}")
@@ -1442,15 +1864,25 @@ async def on_message(message: discord.Message):
     # ── NLP: classify intent via Claude ──
 
     prompt = parse_prompt(content, client.user.id)
+    reply_monitor_config = None
     if prompt is None:
         if message.reference and message.reference.message_id:
             try:
                 ref_msg = await message.channel.fetch_message(message.reference.message_id)
+                print(f"[REPLY-DETECT] ref author={ref_msg.author.display_name}, webhook_id={ref_msg.webhook_id}, is_bot_user={ref_msg.author == client.user}", flush=True)
                 if ref_msg.author == client.user:
                     prompt = content
-            except Exception:
-                pass
+                elif ref_msg.webhook_id:
+                    found = _find_monitor_by_pikmin_name(ref_msg.author.display_name)
+                    print(f"[REPLY-DETECT] pikmin lookup '{ref_msg.author.display_name}' -> {found.get('name') if found else None}", flush=True)
+                    if found:
+                        reply_monitor_config = found
+                        prompt = content
+            except Exception as e:
+                print(f"[REPLY-DETECT] error: {e}", flush=True)
     if prompt is None and isinstance(message.channel, discord.Thread) and message.channel.id in bot_threads:
+        prompt = content
+    if prompt is None and message.channel.id in pending_monitors:
         prompt = content
     if prompt is None:
         return
@@ -1469,13 +1901,25 @@ async def on_message(message: discord.Message):
         ctx_parts.append("In a thread")
     if message.channel.id in pending_monitors:
         ctx_parts.append("Pending monitor setup awaiting confirmation")
+    if reply_monitor_config:
+        rn = reply_monitor_config.get("nickname", reply_monitor_config["name"])
+        ctx_parts.append(f"User is replying to monitor '{rn}' webhook message")
     if monitor_configs:
         nicknames = [f"{c.get('nickname', c['name'])}({c['name']})" for c in monitor_configs.values() if c.get("enabled")]
         if nicknames:
             ctx_parts.append(f"Active monitors: {', '.join(nicknames)}")
     context = "; ".join(ctx_parts)
 
-    intent = await classify_intent(prompt, context)
+    # Determine which intents are valid in this context
+    thread_scoped = incident or message.channel.id in channel_worktrees
+    if thread_scoped:
+        # In incident/worktree threads, only allow thread-relevant intents
+        allowed_intents = {"monitor_dismiss", "monitor_teach", "task_done", "chat"}
+        intent = await classify_intent(prompt, context)
+        if intent not in allowed_intents:
+            intent = "chat"
+    else:
+        intent = await classify_intent(prompt, context)
 
     # ── Handle intents ──
 
@@ -1512,22 +1956,61 @@ async def on_message(message: discord.Message):
         return
 
     if intent == "monitor_remove":
+        # First check if there's a pending (unconfirmed) monitor to cancel
+        if message.channel.id in pending_monitors:
+            cancelled = pending_monitors.pop(message.channel.id)
+            await message.reply(f"✅ 已取消 **{cancelled['name']}** 的監控設定。")
+            return
         target = detect_project(prompt)
-        removed = False
+        matched_config = None
+        matched_mid = None
         for mid, config in list(monitor_configs.items()):
             if target and target.lower() not in config["name"].lower():
                 continue
-            task = active_monitor_tasks.pop(mid, None)
-            if task:
-                task.cancel()
-            config["enabled"] = False
-            del monitor_configs[mid]
-            removed = True
-            await message.reply(f"✅ 已停止監控 **{config['name']}**")
+            matched_config = config
+            matched_mid = mid
             break
-        if not removed:
+        if not matched_config:
             await message.reply("❌ 找不到對應的監控。用「列出監控」查看。")
-        _save_monitors()
+            _save_monitors()
+            return
+        # Store pending removal for confirmation
+        pending_monitor_removals[message.channel.id] = {
+            "mid": matched_mid,
+            "config": matched_config,
+            "user_id": message.author.id,
+        }
+        await message.reply(
+            f"⚠️ 確定要停止監控 **{matched_config['name']}** 嗎？回覆「確定」或「對」來確認。"
+        )
+        return
+
+    if intent == "monitor_resume":
+        target = detect_project(prompt)
+        resumed = False
+        for mid, config in monitor_configs.items():
+            if config.get("enabled"):
+                continue  # Already running
+            if target and target.lower() not in config["name"].lower():
+                continue
+            config["enabled"] = True
+            _save_monitors()
+            active_monitor_tasks[mid] = asyncio.create_task(
+                monitor_loop(mid, message.channel)
+            )
+            nickname = config.get("nickname", config["name"])
+            display = f"{nickname} ({config['name']})" if nickname != config["name"] else config["name"]
+            await message.reply(f"✅ **{display}** 已重新啟動！")
+            resumed = True
+            break
+        if not resumed:
+            # Check if there are any disabled monitors
+            disabled = [c for c in monitor_configs.values() if not c.get("enabled")]
+            if disabled:
+                names = ", ".join(c["name"] for c in disabled)
+                await message.reply(f"❌ 找不到匹配的已停用監控。已停用的有：{names}")
+            else:
+                await message.reply("❌ 沒有已停用的監控可以恢復。")
         return
 
     if intent == "monitor_list":
@@ -1537,7 +2020,12 @@ async def on_message(message: discord.Message):
             lines = ["**監控列表：**"]
             for mid, config in monitor_configs.items():
                 running = mid in active_monitor_tasks and not active_monitor_tasks[mid].done()
-                status = "🟢 運行中" if running else "🔴 已停止"
+                if not config.get("enabled"):
+                    status = "⏸️ 已停用（可用「重啟監控」恢復）"
+                elif running:
+                    status = "🟢 運行中"
+                else:
+                    status = "🔴 已停止"
                 inc = find_incident_by_monitor(mid)
                 if inc:
                     status += f" ⚠️ incident: {inc['status']}"
@@ -1554,9 +2042,9 @@ async def on_message(message: discord.Message):
         return
 
     if intent == "monitor_add":
-        config = parse_monitor_config(prompt, message.channel.id)
+        config = await parse_monitor_config(prompt, message.channel.id)
         if not config:
-            await message.reply("❌ 找不到專案名稱。例如：「監控 erigon」")
+            await message.reply("❌ 找不到監控目標。例如：「監控 erigon」或用 `!monitor <描述>` 建立")
             return
         for existing in monitor_configs.values():
             if existing["name"] == config["name"] and existing.get("enabled"):
@@ -1569,13 +2057,35 @@ async def on_message(message: discord.Message):
 
     if intent == "monitor_adjust" and message.channel.id in pending_monitors:
         config = pending_monitors[message.channel.id]
-        config = adjust_monitor_config(config, prompt)
+        thinking = await message.reply("🔧 調整中...")
+        config = await adjust_monitor_config(config, prompt)
         pending_monitors[message.channel.id] = config
-        await message.reply(format_monitor_proposal(config))
+        await thinking.edit(content=format_monitor_proposal(config))
         return
+
+    # Handle pending monitor removal confirmation
+    if message.channel.id in pending_monitor_removals:
+        removal = pending_monitor_removals[message.channel.id]
+        if intent == "monitor_confirm" or prompt.strip() in ("確定", "對", "是", "好", "yes", "y"):
+            pending_monitor_removals.pop(message.channel.id)
+            mid = removal["mid"]
+            config = removal["config"]
+            task = active_monitor_tasks.pop(mid, None)
+            if task:
+                task.cancel()
+            config["enabled"] = False
+            _save_monitors()
+            await message.reply(f"✅ 已停止監控 **{config['name']}**（config 保留，可用「重啟監控 {config['name']}」恢復）")
+            return
+        else:
+            # User said something else — cancel the pending removal
+            pending_monitor_removals.pop(message.channel.id)
 
     if intent == "monitor_confirm" and message.channel.id in pending_monitors:
         config = pending_monitors.pop(message.channel.id)
+        # Assign a pikmin to this monitor
+        pidx = _assign_pikmin(message.channel.id, monitor_id=config["id"])
+        config["pikmin_index"] = pidx
         monitor_configs[config["id"]] = config
         _save_monitors()
         active_monitor_tasks[config["id"]] = asyncio.create_task(
@@ -1584,15 +2094,18 @@ async def on_message(message: discord.Message):
         nickname = config.get("nickname", config["name"])
         checks_str = "、".join(config["checks"])
         display = f"{nickname} ({config['name']})" if nickname != config["name"] else config["name"]
-        await message.reply(
-            f"✅ **{display}** 已上線！\n"
+        pikmin = PIKMIN_POOL[pidx]
+        await pikmin_send(
+            message.channel,
+            f"✅ **{display}** 已上線！由 **{pikmin['name']}** 負責 🫡\n"
             f"檢查項目：{checks_str}\n"
-            f"每 {config['check_interval'] // 60} 分鐘檢查，每 {config['summary_interval'] // 3600} 小時回報"
+            f"每 {config['check_interval'] // 60} 分鐘檢查，每 {config['summary_interval'] // 3600} 小時回報",
+            pikmin,
         )
         return
 
     if intent == "monitor_teach":
-        target_config = _find_monitor_by_text(prompt)
+        target_config = reply_monitor_config or _find_monitor_by_text(prompt)
         if not target_config:
             # If only one monitor, assume that one
             enabled = [c for c in monitor_configs.values() if c.get("enabled")]
@@ -1625,7 +2138,7 @@ async def on_message(message: discord.Message):
         if not new_channel:
             await message.reply("❌ 找不到那個 channel，確認 bot 有權限存取。")
             return
-        target_config = _find_monitor_by_text(prompt)
+        target_config = reply_monitor_config or _find_monitor_by_text(prompt)
         if not target_config:
             enabled = [c for c in monitor_configs.values() if c.get("enabled")]
             if len(enabled) == 1:
@@ -1691,12 +2204,15 @@ async def on_message(message: discord.Message):
             channel_worktrees[thread.id] = {
                 "repo": repo_path, "worktree": worktree_path, "branch": branch,
             }
+            pidx = _assign_pikmin(thread.id)
+            pikmin_assignments[thread.id] = pidx
+            pikmin = PIKMIN_POOL[pidx]
             _save_state()
-            await status.edit(content=f"✅ Task 已建立！\n📂 Worktree: `{worktree_path}`\n🌿 Branch: `{branch}`")
-            await thread.send(
+            await status.edit(content=f"✅ Task 已建立！由 **{pikmin['name']}** 負責\n📂 Worktree: `{worktree_path}`\n🌿 Branch: `{branch}`")
+            await pikmin_send(thread,
                 f"🔧 **Task: {description}**\n📂 工作目錄：`{worktree_path}`\n🌿 Branch：`{branch}`\n\n"
-                f"直接在這裡打字開始工作。完成後說「做完了」或 `!done`。"
-            )
+                f"我是 **{pikmin['name']}**，直接在這裡打字開始工作。完成後說「做完了」或 `!done`。",
+                pikmin)
         except Exception as e:
             await remove_worktree(repo_path, worktree_path)
             await status.edit(content=f"❌ 建立 thread 失敗：{e}")
@@ -1708,8 +2224,11 @@ async def on_message(message: discord.Message):
             thread = await message.create_thread(name=topic)
             bot_threads.add(thread.id)
             channel_workdir[thread.id] = channel_workdir.get(message.channel.id, WORK_ROOT)
-            await thread.send(f"🧵 Thread 已建立！直接在這裡打字就能跟我對話。\n工作目錄：`{channel_workdir[thread.id]}`")
+            pidx = _assign_pikmin(thread.id)
+            pikmin_assignments[thread.id] = pidx
+            pikmin = PIKMIN_POOL[pidx]
             _save_state()
+            await pikmin_send(thread, f"🧵 Thread 已建立！我是 **{pikmin['name']}**，由我來負責。\n工作目錄：`{channel_workdir[thread.id]}`", pikmin)
         except Exception as e:
             await message.reply(f"❌ 無法建立 thread: {e}")
         return
@@ -1738,13 +2257,51 @@ async def on_message(message: discord.Message):
 
         # Inject cross-thread context into prompt
         cross_ctx = build_cross_thread_context(message.channel.id)
-        enriched_prompt = f"{cross_ctx}\n\n---\n{prompt}" if cross_ctx else prompt
+        enriched_prompt = (
+            f"[以下是其他頻道的背景資訊，僅供參考，不要用來回答當前問題，除非用戶明確提及]\n"
+            f"{cross_ctx}\n\n---\n[當前頻道的問題]\n{prompt}"
+        ) if cross_ctx else prompt
 
-        thinking = await message.reply("⏳ 處理中...")
+        # Inject monitor context if replying to a monitor's message or in incident thread
+        monitor_sys_prompt = None
+        target_monitor = None
+        if reply_monitor_config:
+            target_monitor = reply_monitor_config
+        elif incident:
+            target_monitor = monitor_configs.get(incident.get("monitor_id"), {})
+
+        if target_monitor:
+            monitor_sys_prompt = monitor_system_prompt(target_monitor)
+            monitor_ctx_parts = []
+            if target_monitor.get("check_commands"):
+                monitor_ctx_parts.append(f"監控檢查方式：\n{target_monitor['check_commands']}")
+            if target_monitor.get("check_instruction"):
+                monitor_ctx_parts.append(f"監控描述：\n{target_monitor['check_instruction']}")
+            mid = target_monitor.get("id")
+            hist = monitor_histories.get(mid, []) if mid else []
+            if hist:
+                recent = hist[-3:]
+                hist_text = "\n\n".join(f"--- {h['time']} ---\n{h['data']}" for h in recent)
+                monitor_ctx_parts.append(f"最近的監控數據：\n{hist_text}")
+            if monitor_ctx_parts:
+                enriched_prompt = "\n\n".join(monitor_ctx_parts) + f"\n\n---\n用戶問題：{enriched_prompt}"
+
+        # Determine pikmin for this channel
+        pikmin = _get_pikmin(message.channel.id)
+        # If replying to a monitor or in incident thread, use that monitor's pikmin
+        if not pikmin and target_monitor:
+            pidx = target_monitor.get("pikmin_index")
+            if pidx is not None and 0 <= pidx < len(PIKMIN_POOL):
+                pikmin = PIKMIN_POOL[pidx]
+        if pikmin:
+            thinking = await pikmin_send(message.channel, "⏳ 處理中...", pikmin)
+        else:
+            thinking = await message.reply("⏳ 處理中...")
 
         try:
             result, new_session_id = await run_claude(
-                enriched_prompt, cwd, session_id, status_msg=thinking, channel=message.channel
+                enriched_prompt, cwd, session_id, status_msg=thinking, channel=message.channel,
+                system_prompt=monitor_sys_prompt,
             )
             print(f"[REPLY] result length={len(result)}, session={new_session_id}", flush=True)
             if new_session_id:
@@ -1756,13 +2313,22 @@ async def on_message(message: discord.Message):
 
             chunks = split_message(result)
             print(f"[REPLY] sending {len(chunks)} chunks, first={len(chunks[0])} chars", flush=True)
-            try:
-                await thinking.edit(content=chunks[0])
-            except Exception as edit_err:
-                print(f"[REPLY] edit failed: {edit_err}, sending as new message", flush=True)
-                await message.channel.send(chunks[0])
-            for i, chunk in enumerate(chunks[1:], 2):
-                await message.channel.send(chunk)
+            if pikmin:
+                try:
+                    await pikmin_edit(thinking, chunks[0], message.channel)
+                except Exception as edit_err:
+                    print(f"[REPLY] pikmin edit failed: {edit_err}, sending new", flush=True)
+                    await pikmin_send(message.channel, chunks[0], pikmin)
+                for chunk in chunks[1:]:
+                    await pikmin_send(message.channel, chunk, pikmin)
+            else:
+                try:
+                    await thinking.edit(content=chunks[0])
+                except Exception as edit_err:
+                    print(f"[REPLY] edit failed: {edit_err}, sending as new message", flush=True)
+                    await message.channel.send(chunks[0])
+                for chunk in chunks[1:]:
+                    await message.channel.send(chunk)
             print(f"[REPLY] all chunks sent", flush=True)
 
             # Update thread summary in background (non-blocking)
