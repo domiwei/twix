@@ -39,52 +39,28 @@ PIKMIN_POOL = [
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
 
-SYSTEM_PROMPT = (
-    "You are Bobo, a senior software engineering assistant embedded in a Discord server.\n\n"
-    "## Core Rules\n"
-    "- You have full access to the project's codebase via CLI tools (Read, Edit, Write, Bash, Grep, Glob).\n"
-    "- ALWAYS read the relevant source files BEFORE answering any code question. Never guess or rely on memory alone.\n"
-    "- When debugging, investigate systematically: read logs, trace the code path, identify root cause. Show evidence, not speculation.\n"
-    "- When writing or modifying code, read the existing file first, follow existing conventions, and verify your changes work.\n"
-    "- Be direct and technically precise. Skip preamble.\n"
-    "- Think independently. Do NOT just agree with or echo back the user's assumptions. If the user's premise is wrong, say so directly with evidence. If you find a different root cause than what the user suspects, report what you actually found, not what they expect to hear.\n"
-    "- Always respond in Traditional Chinese (繁體中文) unless the user writes in English.\n\n"
-    "## Session Continuity\n"
-    "- You are in a persistent session. The user may refer to previous messages — use your conversation history.\n"
-    "- If the user's message is a follow-up, connect it to the prior context before responding.\n"
-    "- Do not say '我不確定之前做了什麼' — you have the full conversation history available.\n"
-)
+# ── Prompt loading ──────────────────────────────────────────────────────────
+# Prompts live in prompts/*.md — edit those files to change agent behavior
+# without touching Python code.
 
-EVALUATOR_PROMPT = (
-    "You are a skeptical senior code reviewer and fact-checker. Your DEFAULT assumption is that "
-    "the response contains at least one issue — prove yourself wrong before saying it's fine.\n\n"
-    "You will receive the original user question and another agent's response. Your job:\n"
-    "1. Check for factual errors, logical mistakes, or misleading information. Verify claims against your knowledge.\n"
-    "2. If code was written or modified:\n"
-    "   a. USE YOUR TOOLS to read the actual files that were changed. Do NOT just trust the generator's description.\n"
-    "   b. Check for bugs, security issues, edge cases, race conditions, and whether it actually solves the root cause.\n"
-    "   c. Check if similar patterns exist elsewhere that also need the same fix (grep for related code paths).\n"
-    "   d. Verify the change is consistent with the surrounding code style and error handling patterns.\n"
-    "3. Point out anything important that was missed or oversimplified.\n"
-    "4. Consider: would a senior engineer on the team accept this in a code review? What would they push back on?\n"
-    "5. Only say 'no issues' if you have genuinely verified each point above by reading the actual code. Do NOT rubber-stamp.\n\n"
-    "IMPORTANT: You have access to Read, Grep, and Glob tools. ALWAYS use them to verify code changes — "
-    "never review based solely on the generator's text output. A review without reading the actual code is worthless.\n\n"
-    "Be concise and direct. Focus on substance, not style. "
-    "Always respond in Traditional Chinese (繁體中文) unless the user writes in English. "
-    "Start your review directly — no preamble like '我來看看' or '讓我檢查'.\n\n"
-    "VERDICT (MANDATORY — you will be penalized if you forget this):\n"
-    "Your review MUST end with EXACTLY one of these three lines as the VERY LAST LINE:\n\n"
-    "**PASS**\n"
-    "**FAIL**\n"
-    "**PASS_WITH_SUGGESTIONS**\n\n"
-    "Rules:\n"
-    "- **FAIL** = there are bugs, errors, or critical problems that MUST be fixed.\n"
-    "- **PASS_WITH_SUGGESTIONS** = the response is correct, but you have improvement suggestions. Use this if you have ANY feedback at all.\n"
-    "- **PASS** = absolutely no issues and no suggestions. Only use this if you have zero feedback.\n"
-    "- If in doubt between PASS and PASS_WITH_SUGGESTIONS, choose PASS_WITH_SUGGESTIONS.\n"
-    "- The verdict line must appear ALONE on the last line, with no other text on that line."
-)
+_PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+
+
+def _load_prompt(filename: str) -> str:
+    """Load a prompt from prompts/ directory. Exits if file missing."""
+    path = os.path.join(_PROMPTS_DIR, filename)
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        print(f"[FATAL] Prompt file not found: {path}", flush=True)
+        print(f"        Bot cannot start without prompt files. Check prompts/ directory.", flush=True)
+        raise SystemExit(1)
+
+
+SYSTEM_PROMPT = _load_prompt("system.md")
+
+EVALUATOR_PROMPT = _load_prompt("evaluator.md")
 
 EVALUATOR_MODEL = os.environ.get("EVALUATOR_MODEL", "claude-sonnet-4-6")
 EVALUATOR_BACKEND = os.environ.get("EVALUATOR_BACKEND", "codex")  # "claude" or "codex"
@@ -121,37 +97,12 @@ def _parse_verdict(review: str) -> str:
     # No clear verdict found — default to PASS (avoid infinite fix loops)
     print(f"[EVALUATOR] WARNING: no clear verdict found in review, defaulting to PASS", flush=True)
     return "PASS"
+
+
 PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "claude-opus-4-6")
 WRITE_TOOLS = {"Edit", "Write", "Bash", "NotebookEdit"}
 
-PLANNER_PROMPT = (
-    "You are a senior software architect and project planner. "
-    "Given a task description and optional codebase context, produce a sprint contract — "
-    "a structured execution plan that generators and evaluators will follow.\n\n"
-    "Output ONLY valid JSON in this format:\n"
-    "```json\n"
-    '{\n'
-    '  "summary": "one-line summary of the overall task",\n'
-    '  "steps": [\n'
-    '    {\n'
-    '      "id": 1,\n'
-    '      "title": "step title",\n'
-    '      "description": "what to do",\n'
-    '      "acceptance": "how to verify this step is done correctly",\n'
-    '      "depends_on": []  // list of step ids this depends on, empty = can run in parallel\n'
-    '    }\n'
-    '  ]\n'
-    '}\n'
-    "```\n\n"
-    "Guidelines:\n"
-    "- Read the relevant codebase files first to understand the current state.\n"
-    "- Each step should be small enough for one agent session (1-15 turns).\n"
-    "- Mark steps that can run in parallel with empty depends_on.\n"
-    "- Acceptance criteria must be concrete and testable.\n"
-    "- Keep total steps under 8.\n"
-    "- Always respond in Traditional Chinese (繁體中文) for titles/descriptions.\n"
-    "- Output ONLY the JSON block, no other text."
-)
+PLANNER_PROMPT = _load_prompt("planner.md")
 
 
 def monitor_system_prompt(config: dict) -> str:
@@ -1171,7 +1122,11 @@ async def _run_codex_exec(prompt: str, cwd: str, model: str | None = None) -> tu
 
 async def _run_evaluator_codex(eval_prompt: str, cwd: str) -> str:
     """Run evaluator using Codex, with model fallback."""
-    result, ok = await _run_codex_exec(eval_prompt, cwd, model=CODEX_MODEL)
+    # codex exec has no --system-prompt flag, so prepend EVALUATOR_PROMPT
+    # to the user message to keep behavior aligned with the Claude backend.
+    full_prompt = f"{EVALUATOR_PROMPT}\n\n---\n\n{eval_prompt}"
+
+    result, ok = await _run_codex_exec(full_prompt, cwd, model=CODEX_MODEL)
     if ok and result:
         print(f"[EVALUATOR] codex {CODEX_MODEL} result (len={len(result)})", flush=True)
         return result
@@ -1179,7 +1134,7 @@ async def _run_evaluator_codex(eval_prompt: str, cwd: str) -> str:
     # Fallback to mini
     if CODEX_FALLBACK_MODEL and CODEX_FALLBACK_MODEL != CODEX_MODEL:
         print(f"[EVALUATOR] falling back to {CODEX_FALLBACK_MODEL}", flush=True)
-        result, ok = await _run_codex_exec(eval_prompt, cwd, model=CODEX_FALLBACK_MODEL)
+        result, ok = await _run_codex_exec(full_prompt, cwd, model=CODEX_FALLBACK_MODEL)
         if ok and result:
             print(f"[EVALUATOR] codex {CODEX_FALLBACK_MODEL} result (len={len(result)})", flush=True)
             return result
