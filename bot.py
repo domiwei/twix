@@ -216,6 +216,10 @@ channel_session_ts: dict[int, float] = {}  # channel_id -> last session activity
 channel_cumulative_turns: dict[int, int] = {}  # channel_id -> total turns since last relay
 channel_relay_summaries: dict[int, list[str]] = {}  # channel_id -> recent relay summaries (max 5)
 channel_last_usage: dict[int, dict] = {}  # channel_id -> last usage data from Claude
+# channel_id -> git sha from `git stash create` taken just before the last generator
+# turn. Used by run_evaluator to scope verdict to this turn's delta; prior-turn
+# uncommitted WIP stays as context but is out of verdict scope.
+channel_turn_snapshot: dict[int, str | None] = {}
 CONTEXT_WINDOW_TOKENS = 200_000  # Opus context window
 CONTEXT_RELAY_THRESHOLD = int(os.environ.get("CONTEXT_RELAY_THRESHOLD", "80"))
 _channel_locks: dict[int, asyncio.Lock] = {}  # per-channel lock to prevent concurrent processing
@@ -577,10 +581,11 @@ def _format_tool_desc(name: str, input_data: dict) -> str:
         return f"🔧 {name}"
 
 
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))  # 30 minutes default
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "7200"))  # 2h default — generator turns
+EVALUATOR_TIMEOUT = int(os.environ.get("EVALUATOR_TIMEOUT", "1800"))  # 30m default — evaluator / review passes
 
 
-async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple[str, str | None, list[str], int, dict]:
+async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout: int | None = None) -> tuple[str, str | None, list[str], int, dict]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
@@ -674,10 +679,11 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple
         except (asyncio.TimeoutError, Exception):
             pass
 
+    effective_timeout = timeout if timeout is not None else CLAUDE_TIMEOUT
     try:
-        await asyncio.wait_for(_do_stream(), timeout=CLAUDE_TIMEOUT)
+        await asyncio.wait_for(_do_stream(), timeout=effective_timeout)
     except asyncio.TimeoutError:
-        print(f"[CLAUDE] TIMEOUT after {CLAUDE_TIMEOUT}s, killing process", flush=True)
+        print(f"[CLAUDE] TIMEOUT after {effective_timeout}s, killing process", flush=True)
         try:
             proc.kill()
             await proc.wait()
@@ -685,10 +691,10 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None) -> tuple
             pass
         # Don't discard collected content — append timeout notice and let it through
         if assistant_texts:
-            assistant_texts.append(f"\n\n⏰ *（已執行 {CLAUDE_TIMEOUT // 60} 分鐘，自動截止。以上是截止前的分析。）*")
+            assistant_texts.append(f"\n\n⏰ *（已執行 {effective_timeout // 60} 分鐘，自動截止。以上是截止前的分析。）*")
         if status_msg:
             try:
-                await status_msg.edit(content=f"⏰ 已執行 {CLAUDE_TIMEOUT // 60} 分鐘，整理已有結果...")
+                await status_msg.edit(content=f"⏰ 已執行 {effective_timeout // 60} 分鐘，整理已有結果...")
             except Exception:
                 pass
     except asyncio.CancelledError:
@@ -771,6 +777,12 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
     if session_id:
         cmd.extend(["--resume", session_id])
 
+    # Snapshot working tree before generator runs. run_evaluator reads this
+    # to scope the verdict to what THIS turn changed, while still showing the
+    # full WIP as context. No-op outside a git repo.
+    if channel is not None:
+        channel_turn_snapshot[channel.id] = await _git_stash_snapshot(cwd)
+
     result, new_session_id, tools, turns, usage = await _run_claude_stream(cmd, cwd, status_msg)
 
     # If resume failed, rebuild context from thread history
@@ -801,6 +813,154 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
         channel_session_ts[channel.id] = time.time()
 
     return result or "(no output)", new_session_id, tools, turns, usage
+
+
+# ── Git helpers for evaluator scoping ────────────────────────────────────────
+
+
+async def _git_stash_snapshot(cwd: str) -> str | None:
+    """Capture a no-side-effect snapshot of the current working tree.
+
+    Returns the commit sha produced by `git stash create`, or None if the
+    directory is not a git repo, the working tree is clean, or the command
+    fails. `git stash create` builds a stash commit but does NOT move the
+    stash stack or touch the index/working tree — safe to run transparently
+    before each generator turn.
+    """
+    async def _git(args: list[str], timeout: float = 10.0) -> str | None:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args, cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0:
+                return None
+            return out.decode("utf-8", errors="replace").strip()
+        except Exception:
+            return None
+
+    is_git = await _git(["rev-parse", "--is-inside-work-tree"], timeout=5)
+    if is_git != "true":
+        return None
+    sha = await _git(["stash", "create"])
+    return sha or None
+
+
+async def _git_diff(cwd: str, base: str, max_chars: int = 15000) -> tuple[str, str]:
+    """Return (full_diff, summary) for `git diff <base>`.
+
+    The full diff is truncated to max_chars with a trailing marker; summary is
+    the `--stat` output. Either may be empty if the diff is empty or git fails.
+    """
+    async def _git(args: list[str], timeout: float = 20.0) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args, cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0:
+                return ""
+            return out.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+
+    full = await _git(["diff", base])
+    stat = await _git(["diff", "--stat", base])
+    if len(full) > max_chars:
+        full = full[:max_chars] + f"\n… (truncated at {max_chars} chars — see --stat above)"
+    return full.rstrip(), stat.rstrip()
+
+
+async def _build_review_diff_sections(cwd: str, before_sha: str | None) -> str:
+    """Build diff sections for the evaluator prompt.
+
+    Produces up to two sections: full WIP context (`git diff HEAD`) and the
+    current turn's scoped delta (`git diff <before_sha>`). Returns an empty
+    string if cwd is not a git repo or there is nothing to show.
+    """
+    # Cheap repo check; skip entirely if not a git checkout.
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--is-inside-work-tree", cwd=cwd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if out.decode().strip() != "true":
+            return ""
+    except Exception:
+        return ""
+
+    async def _git(args: list[str], timeout: float = 10.0) -> str:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args, cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return out.decode("utf-8", errors="replace") if proc.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    wip_diff, wip_stat = await _git_diff(cwd, "HEAD")
+    scope_base = before_sha or "HEAD"
+    scope_diff, scope_stat = await _git_diff(cwd, scope_base)
+    status = (await _git(["status", "--porcelain=v1"])).rstrip()
+
+    parts = []
+
+    wip_body = []
+    if wip_diff:
+        wip_body.append(f"```\n{wip_stat}\n```\n```diff\n{wip_diff}\n```")
+    # Untracked files never show up in `git diff`; list them so the reviewer
+    # knows to `Read` newly created files instead of trusting the generator.
+    untracked = [line[3:] for line in status.splitlines() if line.startswith("?? ")]
+    if untracked:
+        wip_body.append(
+            "Untracked / new files (not shown in diff — use Read to view):\n"
+            + "\n".join(f"- {p}" for p in untracked)
+        )
+    if wip_body:
+        parts.append(
+            "## WIP Context（整個 working tree vs HEAD — 包含前幾回合累積；僅作為 context，不是 review 目標）\n"
+            + "\n\n".join(wip_body)
+        )
+    else:
+        parts.append("## WIP Context\n（working tree 跟 HEAD 一致，沒有未 commit 改動）")
+
+    if before_sha:
+        scope_body = []
+        if scope_diff:
+            scope_body.append(f"```\n{scope_stat}\n```\n```diff\n{scope_diff}\n```")
+        if untracked:
+            scope_body.append(
+                "Untracked files present (may be new from this turn — cross-check "
+                "against generator's description):\n"
+                + "\n".join(f"- {p}" for p in untracked)
+            )
+        if scope_body:
+            parts.append(
+                "## 本回合淨改動（你的 VERDICT scope — 只針對這段下結論）\n"
+                + "\n\n".join(scope_body)
+            )
+        else:
+            parts.append(
+                "## 本回合淨改動\n"
+                "（generator 這回合沒有實際改動 working tree — 可能只是回答問題、讀檔、"
+                "或在 repo 外操作。若回答聲稱改了檔案，要特別警覺。）"
+            )
+    else:
+        parts.append(
+            "## 本回合淨改動\n"
+            "（無法取得 pre-turn snapshot — 可能非 git repo 或快照失敗。"
+            "以 WIP Context 為準，但請注意可能包含前幾回合累積改動。）"
+        )
+
+    return "\n\n".join(parts)
 
 
 # ── Context Relay ─────────────────────────────────────────────────────────────
@@ -1019,7 +1179,7 @@ async def _run_evaluator_claude(eval_prompt: str, cwd: str) -> str:
         "--max-turns", "5",
         "--allowedTools", "Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)",
     ]
-    result, session_id, _, _, _ = await _run_claude_stream(cmd, cwd)
+    result, session_id, _, _, _ = await _run_claude_stream(cmd, cwd, timeout=EVALUATOR_TIMEOUT)
 
     # If result is missing verdict, resume and ask
     has_verdict = result and _parse_verdict(result) != "PASS"
@@ -1054,7 +1214,8 @@ CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.4")
 CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-5.4-mini")
 
 
-async def _run_codex_exec(prompt: str, cwd: str, model: str | None = None) -> tuple[str, bool]:
+async def _run_codex_exec(prompt: str, cwd: str, model: str | None = None,
+                          timeout: int | None = None) -> tuple[str, bool]:
     """Run codex exec and return (result, success). success=False means capacity/auth error."""
     cmd = [
         CODEX_BIN, "exec",
@@ -1070,6 +1231,7 @@ async def _run_codex_exec(prompt: str, cwd: str, model: str | None = None) -> tu
     if OPENAI_API_KEY:
         env["OPENAI_API_KEY"] = OPENAI_API_KEY
 
+    effective_timeout = timeout if timeout is not None else EVALUATOR_TIMEOUT
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=cwd,
@@ -1078,7 +1240,7 @@ async def _run_codex_exec(prompt: str, cwd: str, model: str | None = None) -> tu
             env=env,
             limit=1024 * 1024,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
         output = stdout.decode("utf-8", errors="replace").strip()
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
 
@@ -1113,7 +1275,7 @@ async def _run_codex_exec(prompt: str, cwd: str, model: str | None = None) -> tu
 
         return result or "", True
     except asyncio.TimeoutError:
-        print(f"[CODEX] timeout after 300s (model={model})", flush=True)
+        print(f"[CODEX] timeout after {effective_timeout}s (model={model})", flush=True)
         return "", False
     except Exception as e:
         print(f"[CODEX] error: {e} (model={model})", flush=True)
@@ -1146,30 +1308,27 @@ async def _run_evaluator_codex(eval_prompt: str, cwd: str) -> str:
 async def run_evaluator(user_prompt: str, generator_result: str, cwd: str,
                         channel=None) -> str:
     """Run an evaluator agent to review the generator's output."""
-    # Gather context in parallel
     async def _noop():
         return ""
-    tasks = [_fetch_issue_context(user_prompt + "\n" + generator_result, cwd),
-             fetch_thread_history(channel, limit=15, max_chars=4000) if channel else _noop()]
 
-    issue_ctx, thread_history = await asyncio.gather(*tasks)
+    before_sha = channel_turn_snapshot.get(channel.id) if channel else None
 
-    # Build context sections
+    tasks = [
+        _fetch_issue_context(user_prompt + "\n" + generator_result, cwd),
+        fetch_thread_history(channel, limit=15, max_chars=4000) if channel else _noop(),
+        _build_review_diff_sections(cwd, before_sha),
+    ]
+    issue_ctx, thread_history, diff_sections = await asyncio.gather(*tasks)
+
     sections = [f"## 用戶原始問題\n{user_prompt}"]
     if thread_history:
         sections.append(f"## 對話歷史（Thread Context）\n{thread_history}")
     if issue_ctx:
         sections.append(f"## 相關 GitHub Issue\n{issue_ctx}")
     sections.append(f"## Generator 的回答\n{generator_result}")
-    sections.append(
-        f"## 工作目錄\n`{cwd}`\n\n"
-        "請 review 以上內容。自己去確認實際改了什麼、改得對不對、有沒有遺漏。不要只看 Generator 的文字描述。\n\n"
-        "VERDICT (MANDATORY):\n"
-        "Your review MUST end with EXACTLY one of these three lines as the VERY LAST LINE:\n"
-        "**PASS** — absolutely no issues\n"
-        "**FAIL** — bugs, errors, or critical problems that MUST be fixed\n"
-        "**PASS_WITH_SUGGESTIONS** — correct but has improvement suggestions\n"
-    )
+    if diff_sections:
+        sections.append(diff_sections)
+    sections.append(f"## 工作目錄\n`{cwd}`\n\n請 review 以上內容。")
 
     eval_prompt = "\n\n".join(sections)
 
@@ -2886,7 +3045,7 @@ async def on_message(message: discord.Message):
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
                 )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=EVALUATOR_TIMEOUT)
                 # codex review outputs to stderr, not stdout
                 result = stdout.decode("utf-8", errors="replace").strip()
                 if not result:
@@ -2903,7 +3062,7 @@ async def on_message(message: discord.Message):
                 if review_start > 0:
                     result = "\n".join(lines[review_start:])
             except asyncio.TimeoutError:
-                result = "⏰ Codex review 超時（5分鐘）"
+                result = f"⏰ Codex review 超時（{EVALUATOR_TIMEOUT // 60} 分鐘）"
             except Exception as e:
                 result = f"❌ Codex review 失敗: {e}"
             chunks = split_message(result)
