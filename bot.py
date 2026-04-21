@@ -1350,11 +1350,83 @@ def _has_write_tools(tools_used: list[str]) -> bool:
     return False
 
 
+TODO_DETECT_MIN_RESPONSE_LEN = 150
+TODO_MAX_ITEMS = 8
+
+
+async def _detect_actionable_todos(response: str) -> list[str]:
+    """Use Haiku to decide whether `response` contains an actionable TODO list.
+
+    Returns extracted TODO strings, or [] if none. Conservative — only counts
+    items framed as concrete code fixes / modifications the user could hand off
+    to another coding agent.
+    """
+    if not response or len(response) < TODO_DETECT_MIN_RESPONSE_LEN:
+        return []
+
+    prompt = (
+        "以下是 coding assistant 的回答。判斷它是否列出 actionable 的 code TODO 項目 "
+        "— 也就是使用者可以交給另一個 coding agent 逐條去執行的具體改動。\n\n"
+        "算 TODO：具體的 bug fix、具體的 refactor、指名了檔案/函式/行為的改動項、"
+        "檢查 code 後列出的 issue / 問題清單。\n"
+        "不算 TODO：一般性建議、「可以考慮…」級別的意見、純解釋/回答、探索性討論、"
+        "已經做完事情的總結、已經修好的項目。\n\n"
+        "每一條 TODO 要自成一句完整敘述，帶上必要的上下文（檔案名、函式名、情境），"
+        "因為接手的 agent 只會看到 TODO 文字本身，不會看到這份回答。\n\n"
+        "嚴格輸出 JSON，不要任何額外文字、不要 markdown fence：\n"
+        '{"todos": ["<具體描述 1>", "<具體描述 2>", ...]}\n\n'
+        "沒有 actionable TODO 時輸出 {\"todos\": []}。\n\n"
+        "Assistant 回答：\n---\n"
+        f"{response}\n"
+        "---"
+    )
+    cmd = [
+        CLAUDE_BIN, "-p", prompt,
+        "--model", SUMMARY_MODEL,
+        "--output-format", "text",
+        "--max-turns", "1",
+        "--allowedTools", "",
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=WORK_ROOT,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=45)
+        text = stdout.decode("utf-8", errors="replace").strip()
+    except Exception as e:
+        print(f"[TODO_DETECT] subprocess error: {e}", flush=True)
+        return []
+
+    match = re.search(r'\{[\s\S]*\}', text)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group())
+    except json.JSONDecodeError:
+        return []
+
+    raw = data.get("todos", [])
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        s = str(item).strip()
+        if not s:
+            continue
+        if len(s) > 500:
+            s = s[:500] + "…"
+        out.append(s)
+    return out[:TODO_MAX_ITEMS]
+
+
 # ── Persistent View Data Store ─────────────────────────────────────────────
 # Keyed by message_id, stores data needed for button callbacks after restart.
 # In-memory only — after restart, buttons gracefully report "bot restarted".
 _review_data: dict[int, dict] = {}
 _suggestion_data: dict[int, dict] = {}
+_todo_dispatch_data: dict[int, dict] = {}
 
 _EXPIRED_MSG = "⚠️ Bot 已重啟，此按鈕已失效。請重新發問或操作。"
 
@@ -1845,6 +1917,110 @@ async def execute_plan(plan: dict, cwd: str, channel, base_pikmin_idx: int):
                     await channel.send(f"⚠️ 步驟 {step_id} 未完全通過驗收。")
 
     await channel.send(f"🏁 **Sprint Contract 完成！** {len(completed)}/{len(steps)} 步驟已完成。")
+
+
+async def _run_todo_dispatch(todos: list[str], cwd: str, channel,
+                             base_pikmin_idx: int) -> None:
+    """Run detected TODOs strictly serially: each as a gen-eval convergence loop.
+
+    Rotates the generator pikmin per TODO so each item visibly runs as a
+    different subagent. Evaluator pikmin is picked by `_pick_eval_pikmin`
+    inside `generator_evaluator_loop`.
+    """
+    total = len(todos)
+    await channel.send(
+        f"🚀 **開始逐項處理 {total} 項 TODO**（串行：一項跑到收斂再進下一項）"
+    )
+
+    for i, todo in enumerate(todos, 1):
+        pidx = (base_pikmin_idx + i) % len(PIKMIN_POOL)
+        gen_pikmin = PIKMIN_POOL[pidx]
+
+        await channel.send(f"---\n## 🔧 TODO {i}/{total}\n{todo}")
+
+        initial_prompt = (
+            f"請處理以下 TODO（來自剛才的 code review / 檢查）：\n\n{todo}\n\n"
+            f"修改完成後，用一兩句話說明你改了什麼、動到哪些檔案。"
+        )
+        eval_context = f"## TODO 項目（本次 generator 的改動目標）\n{todo}"
+
+        try:
+            _, passed = await generator_evaluator_loop(
+                initial_prompt=initial_prompt,
+                cwd=cwd,
+                channel=channel,
+                gen_pikmin=gen_pikmin,
+                eval_context=eval_context,
+                show_status_prefix=f"TODO {i}/{total}",
+            )
+            status = "✅ 通過" if passed else "⚠️ 未完全收斂（繼續下一項）"
+            await channel.send(f"**TODO {i}/{total} {status}**")
+        except Exception as e:
+            print(f"[TODO_DISPATCH] error on TODO {i}: {e}", flush=True)
+            await channel.send(f"❌ TODO {i} 執行失敗：`{e}`")
+
+    await channel.send(f"🏁 **全部 {total} 項 TODO 處理完成**")
+
+
+class TodoDispatchView(discord.ui.View):
+    """Buttons to dispatch or skip detected TODOs for serial subagent processing."""
+
+    def __init__(self, todos: list[str] | None = None, cwd: str = "",
+                 channel=None, base_pikmin_idx: int = 0):
+        super().__init__(timeout=None)
+        self.todos = todos or []
+        self.cwd = cwd
+        self.channel = channel
+        self.base_pikmin_idx = base_pikmin_idx
+
+    def store(self, message_id: int):
+        _todo_dispatch_data[message_id] = {
+            "todos": self.todos,
+            "cwd": self.cwd,
+            "channel_id": self.channel.id if self.channel else None,
+            "base_pikmin_idx": self.base_pikmin_idx,
+        }
+
+    def _load(self, interaction: discord.Interaction) -> bool:
+        data = _todo_dispatch_data.get(interaction.message.id)
+        if not data:
+            return False
+        self.todos = data["todos"]
+        self.cwd = data["cwd"]
+        self.channel = interaction.channel
+        self.base_pikmin_idx = data["base_pikmin_idx"]
+        return True
+
+    @discord.ui.button(label="🚀 逐項派 subagent 處理", style=discord.ButtonStyle.primary,
+                       custom_id="todo_dispatch:run")
+    async def run_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._load(interaction):
+            await interaction.response.edit_message(content=_EXPIRED_MSG, view=None)
+            return
+        print(f"[TODO_DISPATCH] run pressed by {interaction.user} — {len(self.todos)} items", flush=True)
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.NotFound:
+            return
+        _todo_dispatch_data.pop(interaction.message.id, None)
+        asyncio.create_task(_run_todo_dispatch(
+            todos=self.todos, cwd=self.cwd, channel=self.channel,
+            base_pikmin_idx=self.base_pikmin_idx,
+        ))
+
+    @discord.ui.button(label="⏭️ 跳過", style=discord.ButtonStyle.secondary,
+                       custom_id="todo_dispatch:skip")
+    async def skip_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        print(f"[TODO_DISPATCH] skip pressed by {interaction.user}", flush=True)
+        _todo_dispatch_data.pop(interaction.message.id, None)
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.response.edit_message(view=self)
+        except discord.NotFound:
+            pass
 
 
 _plan_data: dict[int, dict] = {}
@@ -2818,6 +2994,7 @@ async def on_ready():
     client.add_view(ReviewView())
     client.add_view(SuggestionView())
     client.add_view(PlanView())
+    client.add_view(TodoDispatchView())
     print(f"Bot is online as {client.user}", flush=True)
     for guild in client.guilds:
         print(f"  Connected to server: {guild.name} (id: {guild.id})", flush=True)
@@ -3885,6 +4062,35 @@ async def on_message(message: discord.Message):
                 for chunk in chunks[1:]:
                     await message.channel.send(chunk)
             print(f"[REPLY] all chunks sent", flush=True)
+
+            # ── TODO dispatch offer (pure-answer responses only) ──
+            # If the response listed actionable TODOs, offer a button to run
+            # each one serially through a gen-eval loop. Skipped when auto-review
+            # is about to fire (write tools path) — that means code was already
+            # written, not merely planned.
+            if not wrote_code and pikmin and result:
+                try:
+                    todos = await _detect_actionable_todos(result)
+                except Exception as detect_err:
+                    print(f"[TODO_DETECT] unexpected error: {detect_err}", flush=True)
+                    todos = []
+                if todos:
+                    print(f"[TODO_DETECT] found {len(todos)} actionable TODOs", flush=True)
+                    base_pidx = pikmin_assignments.get(message.channel.id, 0)
+                    dispatch_view = TodoDispatchView(
+                        todos=todos, cwd=cwd, channel=message.channel,
+                        base_pikmin_idx=base_pidx,
+                    )
+                    preview = "\n".join(
+                        f"**{idx}.** {t[:140]}{'…' if len(t) > 140 else ''}"
+                        for idx, t in enumerate(todos, 1)
+                    )
+                    dispatch_msg = await message.channel.send(
+                        f"📋 **偵測到 {len(todos)} 項 TODO**。要派 subagent 逐項處理嗎？\n"
+                        f"（串行：每項跑 generator + evaluator 到收斂再進下一項）\n\n{preview}",
+                        view=dispatch_view,
+                    )
+                    dispatch_view.store(dispatch_msg.id)
 
             # ── Auto-review for write operations (with dialogue loop) ──
             if wrote_code and pikmin:
