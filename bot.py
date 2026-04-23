@@ -223,12 +223,20 @@ channel_turn_snapshot: dict[int, str | None] = {}
 CONTEXT_WINDOW_TOKENS = 200_000  # Opus context window
 CONTEXT_RELAY_THRESHOLD = int(os.environ.get("CONTEXT_RELAY_THRESHOLD", "80"))
 _channel_locks: dict[int, asyncio.Lock] = {}  # per-channel lock to prevent concurrent processing
+_cwd_locks: dict[str, asyncio.Lock] = {}  # per-cwd lock: two threads on the same working dir serialize
 
 
 def _get_channel_lock(channel_id: int) -> asyncio.Lock:
     if channel_id not in _channel_locks:
         _channel_locks[channel_id] = asyncio.Lock()
     return _channel_locks[channel_id]
+
+
+def _get_cwd_lock(cwd: str) -> asyncio.Lock:
+    key = os.path.realpath(cwd) if cwd else ""
+    if key not in _cwd_locks:
+        _cwd_locks[key] = asyncio.Lock()
+    return _cwd_locks[key]
 
 
 # ── Pikmin Webhook Helpers ────────────────────────────────────────────────────
@@ -551,6 +559,87 @@ async def remove_worktree(repo_path: str, worktree_path: str):
         shutil.rmtree(worktree_path)
 
 
+async def find_main_repo_path(cwd: str) -> str | None:
+    """Given a cwd (possibly a worktree), return the main repo path, or None if not a git repo."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "rev-parse", "--git-common-dir",
+        cwd=cwd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    gitdir = stdout.decode().strip()
+    if not gitdir:
+        return None
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.join(cwd, gitdir)
+    gitdir = os.path.realpath(gitdir)
+    if gitdir.endswith(os.sep + ".git") or gitdir.endswith("/.git"):
+        return gitdir[:-len("/.git")]
+    return None
+
+
+async def find_worktree_for_branch(repo_path: str, branch_name: str) -> str | None:
+    """Return path of existing worktree checked out at branch, or None."""
+    proc = await asyncio.create_subprocess_exec(
+        "git", "worktree", "list", "--porcelain",
+        cwd=repo_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    stdout, _ = await proc.communicate()
+    if proc.returncode != 0:
+        return None
+    target_ref = f"refs/heads/{branch_name}"
+    current_path = None
+    for line in stdout.decode().splitlines():
+        if line.startswith("worktree "):
+            current_path = line[len("worktree "):]
+        elif line.startswith("branch ") and line[len("branch "):] == target_ref:
+            return current_path
+    return None
+
+
+async def branch_exists(repo_path: str, branch_name: str) -> bool:
+    proc = await asyncio.create_subprocess_exec(
+        "git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}",
+        cwd=repo_path,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    await proc.wait()
+    return proc.returncode == 0
+
+
+async def ensure_worktree_for_branch(repo_path: str, branch_name: str) -> str | None:
+    """Find an existing worktree for branch; create a fresh one under WORK_ROOT if branch exists but has no worktree."""
+    existing = await find_worktree_for_branch(repo_path, branch_name)
+    if existing:
+        return existing
+    if not await branch_exists(repo_path, branch_name):
+        return None
+    dir_suffix = branch_name.replace("/", "-")
+    repo_basename = os.path.basename(repo_path)
+    worktree_path = os.path.join(WORK_ROOT, f"{repo_basename}-wt-{dir_suffix}")
+    if os.path.exists(worktree_path):
+        # Stale directory not registered as a worktree — don't clobber.
+        print(f"[WORKTREE] path exists but not registered, skipping: {worktree_path}", flush=True)
+        return None
+    proc = await asyncio.create_subprocess_exec(
+        "git", "worktree", "add", worktree_path, branch_name,
+        cwd=repo_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        print(f"[WORKTREE] add failed for {branch_name}: {stderr.decode()[:200]}", flush=True)
+        return None
+    return worktree_path
+
+
 # ── Claude CLI ───────────────────────────────────────────────────────────────
 
 def _format_tool_desc(name: str, input_data: dict) -> str:
@@ -777,36 +866,39 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
     if session_id:
         cmd.extend(["--resume", session_id])
 
-    # Snapshot working tree before generator runs. run_evaluator reads this
-    # to scope the verdict to what THIS turn changed, while still showing the
-    # full WIP as context. No-op outside a git repo.
-    if channel is not None:
-        channel_turn_snapshot[channel.id] = await _git_stash_snapshot(cwd)
+    # cwd-level lock: two threads/channels that land on the same working dir
+    # must serialize their Claude runs or they'll stomp on each other's git state.
+    async with _get_cwd_lock(cwd):
+        # Snapshot working tree before generator runs. run_evaluator reads this
+        # to scope the verdict to what THIS turn changed, while still showing the
+        # full WIP as context. No-op outside a git repo.
+        if channel is not None:
+            channel_turn_snapshot[channel.id] = await _git_stash_snapshot(cwd)
 
-    result, new_session_id, tools, turns, usage = await _run_claude_stream(cmd, cwd, status_msg)
+        result, new_session_id, tools, turns, usage = await _run_claude_stream(cmd, cwd, status_msg)
 
-    # If resume failed, rebuild context from thread history
-    if session_id and not result:
-        context = ""
-        if channel:
-            try:
-                context = await fetch_thread_history(channel)
-            except Exception:
-                pass
-        rebuilt_prompt = (
-            f"以下是之前的對話紀錄，請根據這些上下文繼續回答：\n\n{context}\n\n---\n用戶最新的訊息：\n{prompt}"
-            if context else prompt
-        )
-        cmd_retry = [
-            CLAUDE_BIN,
-            "-p", rebuilt_prompt,
-            "--model", CLAUDE_MODEL,
-            "--system-prompt", sys_prompt,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--max-turns", str(MAX_TURNS),
-        ]
-        result, new_session_id, tools, turns, usage = await _run_claude_stream(cmd_retry, cwd, status_msg)
+        # If resume failed, rebuild context from thread history
+        if session_id and not result:
+            context = ""
+            if channel:
+                try:
+                    context = await fetch_thread_history(channel)
+                except Exception:
+                    pass
+            rebuilt_prompt = (
+                f"以下是之前的對話紀錄，請根據這些上下文繼續回答：\n\n{context}\n\n---\n用戶最新的訊息：\n{prompt}"
+                if context else prompt
+            )
+            cmd_retry = [
+                CLAUDE_BIN,
+                "-p", rebuilt_prompt,
+                "--model", CLAUDE_MODEL,
+                "--system-prompt", sys_prompt,
+                "--output-format", "stream-json",
+                "--verbose",
+                "--max-turns", str(MAX_TURNS),
+            ]
+            result, new_session_id, tools, turns, usage = await _run_claude_stream(cmd_retry, cwd, status_msg)
 
     # Track session activity timestamp
     if new_session_id and channel:
@@ -1628,8 +1720,6 @@ class ReviewView(discord.ui.View):
                 )
                 if fix_sid:
                     fix_session = fix_sid
-                    channel_session[self.channel.id] = fix_sid
-                    _save_state()
                 result = fix_result
 
                 fix_chunks = split_message(fix_result)
@@ -1919,15 +2009,206 @@ async def execute_plan(plan: dict, cwd: str, channel, base_pikmin_idx: int):
     await channel.send(f"🏁 **Sprint Contract 完成！** {len(completed)}/{len(steps)} 步驟已完成。")
 
 
+async def _detect_base_branch(cwd: str, channel) -> str | None:
+    """Infer which branch the conversation is about so subagent worktrees fork
+    from the right place instead of blindly using HEAD (which is often main).
+
+    Detection order (first non-main hit wins):
+    1. channel_worktrees — thread already has a worktree with an explicit branch
+    2. cwd's current git branch — if not main/master, it's likely intentional
+    3. Recent channel messages — regex scan for branch-like refs
+    """
+    ch_id = channel.id if hasattr(channel, "id") else channel
+
+    # 1. Thread has an explicit worktree
+    wt_info = channel_worktrees.get(ch_id)
+    if wt_info:
+        return wt_info.get("branch")
+
+    # 2. cwd's current git branch (fast, no network)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--abbrev-ref", "HEAD",
+            cwd=cwd, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if proc.returncode == 0:
+            branch = out.decode("utf-8", errors="replace").strip()
+            if branch and branch not in ("main", "master", "HEAD"):
+                return branch
+    except Exception:
+        pass
+
+    # 3. Scan recent messages for branch-like patterns
+    _branch_re = re.compile(
+        r'(?:branch|Branch|🌿)\s*[:`：]*\s*`?'           # label prefix
+        r'((?:feature|fix|bugfix|hotfix|release|chore|refactor|perf|ci|test|wip)'
+        r'/[\w./-]+)',                                     # conventional branch name
+        re.IGNORECASE,
+    )
+    _worktree_path_re = re.compile(
+        r'/root/work/(erigon[\w-]*)',                      # worktree dir name
+    )
+    try:
+        async for msg in channel.history(limit=15, oldest_first=False):
+            if not msg.content:
+                continue
+            m = _branch_re.search(msg.content)
+            if m:
+                return m.group(1)
+            # Infer from worktree path — look up the branch of that worktree
+            pm = _worktree_path_re.search(msg.content)
+            if pm:
+                wt_dir = os.path.join(WORK_ROOT, pm.group(1))
+                if os.path.isdir(wt_dir):
+                    try:
+                        p = await asyncio.create_subprocess_exec(
+                            "git", "rev-parse", "--abbrev-ref", "HEAD",
+                            cwd=wt_dir, stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        o, _ = await asyncio.wait_for(p.communicate(), timeout=5)
+                        if p.returncode == 0:
+                            b = o.decode("utf-8", errors="replace").strip()
+                            if b and b not in ("main", "master", "HEAD"):
+                                return b
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    return None
+
+
+async def _create_subagent_worktree(cwd: str,
+                                    base_ref: str | None = None,
+                                    ) -> tuple[str, str, str, str | None] | None:
+    """Create an isolated git worktree + branch for TODO dispatch subagents.
+
+    The new worktree is placed at `<repo-parent>/<repo-name>-subagents/<ts>`
+    and checked out to a fresh branch `subagent/<YYYY-MM-DD_HHMMSS>` based on
+    *base_ref* (falls back to HEAD when None). The original working tree is
+    untouched — any uncommitted WIP stays where it is.
+
+    Returns (worktree_path, branch_name, wip_notice, actual_base_ref) on
+    success, or None if `cwd` is not a git checkout or worktree creation fails.
+    `wip_notice` is an empty string when the main checkout is clean.
+    `actual_base_ref` is the ref the worktree was forked from (for display).
+    """
+    async def _git(args: list[str], work_dir: str | None = None,
+                   timeout: float = 15.0) -> tuple[str, int]:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", *args, cwd=work_dir or cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            if proc.returncode != 0:
+                print(f"[WORKTREE] git {args[0]} failed: {err.decode(errors='replace').strip()}",
+                      flush=True)
+            return out.decode("utf-8", errors="replace").strip(), proc.returncode
+        except Exception as e:
+            print(f"[WORKTREE] git {args[0]} exception: {e}", flush=True)
+            return "", 1
+
+    is_git, rc = await _git(["rev-parse", "--is-inside-work-tree"])
+    if rc != 0 or is_git != "true":
+        return None
+
+    repo_root, rc = await _git(["rev-parse", "--show-toplevel"])
+    if rc != 0 or not repo_root:
+        return None
+
+    repo_name = os.path.basename(repo_root)
+    ts = time.strftime("%Y-%m-%d_%H%M%S")
+    branch = f"subagent/{ts}"
+    wt_parent = os.path.join(os.path.dirname(repo_root), f"{repo_name}-subagents")
+    try:
+        os.makedirs(wt_parent, exist_ok=True)
+    except OSError as e:
+        print(f"[WORKTREE] mkdir {wt_parent} failed: {e}", flush=True)
+        return None
+    wt_path = os.path.join(wt_parent, ts)
+
+    status, _ = await _git(["status", "--porcelain"])
+    wip_notice = ""
+    if status:
+        wip_count = len(status.splitlines())
+        wip_notice = (
+            f"📝 **提醒**：原 working tree `{repo_root}` 有 {wip_count} 項未 commit 的改動，"
+            f"會原地保留不動。新 worktree 從 `{base_ref or 'HEAD'}` 起建，**不含這些 WIP**。"
+        )
+
+    # Resolve base_ref: try as-is, then origin/<ref>, then fall back to HEAD
+    actual_ref = "HEAD"
+    if base_ref:
+        # Ensure we have the latest remote state for the branch
+        await _git(["fetch", "origin", base_ref], timeout=30.0)
+        # Prefer local branch if it exists
+        _, rc_local = await _git(["rev-parse", "--verify", f"refs/heads/{base_ref}"])
+        if rc_local == 0:
+            actual_ref = base_ref
+        else:
+            # Try remote tracking branch
+            _, rc_remote = await _git(["rev-parse", "--verify", f"origin/{base_ref}"])
+            if rc_remote == 0:
+                actual_ref = f"origin/{base_ref}"
+            else:
+                print(f"[WORKTREE] base_ref '{base_ref}' not found locally or on origin, "
+                      f"falling back to HEAD", flush=True)
+
+    _, rc = await _git(["worktree", "add", wt_path, "-b", branch, actual_ref])
+    if rc != 0:
+        return None
+
+    display_ref = base_ref if actual_ref != "HEAD" else None
+    return wt_path, branch, wip_notice, display_ref
+
+
 async def _run_todo_dispatch(todos: list[str], cwd: str, channel,
-                             base_pikmin_idx: int) -> None:
+                             base_pikmin_idx: int,
+                             base_branch: str | None = None) -> None:
     """Run detected TODOs strictly serially: each as a gen-eval convergence loop.
 
+    Creates an isolated worktree + branch first so subagent changes don't
+    pollute the user's main checkout. *base_branch*, when set, tells the
+    worktree to fork from that branch instead of HEAD (which may be main).
     Rotates the generator pikmin per TODO so each item visibly runs as a
-    different subagent. Evaluator pikmin is picked by `_pick_eval_pikmin`
+    different subagent; evaluator pikmin is picked by `_pick_eval_pikmin`
     inside `generator_evaluator_loop`.
     """
     total = len(todos)
+
+    # Auto-detect base branch from thread context if not explicitly given
+    if not base_branch:
+        base_branch = await _detect_base_branch(cwd, channel)
+        if base_branch:
+            print(f"[TODO_DISPATCH] auto-detected base branch: {base_branch}", flush=True)
+
+    wt_info = await _create_subagent_worktree(cwd, base_ref=base_branch)
+    if wt_info:
+        wt_path, branch, wip_notice, forked_from = wt_info
+        if wip_notice:
+            await channel.send(wip_notice)
+        fork_label = f"（基於 `{forked_from}`）" if forked_from else ""
+        await channel.send(
+            f"🌿 **建立隔離 worktree**{fork_label}\n"
+            f"Branch：`{branch}`\n"
+            f"Path：`{wt_path}`\n"
+            f"所有 subagent 改動都會在這裡，主 checkout 不受影響。"
+        )
+        work_cwd = wt_path
+    else:
+        await channel.send(
+            f"⚠️ 無法建立 worktree（不是 git repo 或建立失敗），**將在原目錄執行**。"
+        )
+        work_cwd = cwd
+        branch = None
+        wt_path = None
+        forked_from = None
+
     await channel.send(
         f"🚀 **開始逐項處理 {total} 項 TODO**（串行：一項跑到收斂再進下一項）"
     )
@@ -1947,7 +2228,7 @@ async def _run_todo_dispatch(todos: list[str], cwd: str, channel,
         try:
             _, passed = await generator_evaluator_loop(
                 initial_prompt=initial_prompt,
-                cwd=cwd,
+                cwd=work_cwd,
                 channel=channel,
                 gen_pikmin=gen_pikmin,
                 eval_context=eval_context,
@@ -1959,19 +2240,31 @@ async def _run_todo_dispatch(todos: list[str], cwd: str, channel,
             print(f"[TODO_DISPATCH] error on TODO {i}: {e}", flush=True)
             await channel.send(f"❌ TODO {i} 執行失敗：`{e}`")
 
-    await channel.send(f"🏁 **全部 {total} 項 TODO 處理完成**")
+    if branch and wt_path:
+        diff_ref = forked_from or "main"
+        await channel.send(
+            f"🏁 **全部 {total} 項 TODO 處理完成**\n"
+            f"改動在 branch **`{branch}`**，worktree `{wt_path}`\n"
+            f"• 切過去看：`cd {wt_path}`\n"
+            f"• 看所有 commits：`git -C {wt_path} log HEAD --not {diff_ref} --oneline`\n"
+            f"• 不需要就丟掉：`git worktree remove {wt_path} && git branch -D {branch}`"
+        )
+    else:
+        await channel.send(f"🏁 **全部 {total} 項 TODO 處理完成**")
 
 
 class TodoDispatchView(discord.ui.View):
     """Buttons to dispatch or skip detected TODOs for serial subagent processing."""
 
     def __init__(self, todos: list[str] | None = None, cwd: str = "",
-                 channel=None, base_pikmin_idx: int = 0):
+                 channel=None, base_pikmin_idx: int = 0,
+                 base_branch: str | None = None):
         super().__init__(timeout=None)
         self.todos = todos or []
         self.cwd = cwd
         self.channel = channel
         self.base_pikmin_idx = base_pikmin_idx
+        self.base_branch = base_branch
 
     def store(self, message_id: int):
         _todo_dispatch_data[message_id] = {
@@ -1979,6 +2272,7 @@ class TodoDispatchView(discord.ui.View):
             "cwd": self.cwd,
             "channel_id": self.channel.id if self.channel else None,
             "base_pikmin_idx": self.base_pikmin_idx,
+            "base_branch": self.base_branch,
         }
 
     def _load(self, interaction: discord.Interaction) -> bool:
@@ -1989,6 +2283,7 @@ class TodoDispatchView(discord.ui.View):
         self.cwd = data["cwd"]
         self.channel = interaction.channel
         self.base_pikmin_idx = data["base_pikmin_idx"]
+        self.base_branch = data.get("base_branch")
         return True
 
     @discord.ui.button(label="🚀 逐項派 subagent 處理", style=discord.ButtonStyle.primary,
@@ -2008,7 +2303,23 @@ class TodoDispatchView(discord.ui.View):
         asyncio.create_task(_run_todo_dispatch(
             todos=self.todos, cwd=self.cwd, channel=self.channel,
             base_pikmin_idx=self.base_pikmin_idx,
+            base_branch=self.base_branch,
         ))
+
+    @discord.ui.button(label="🌿 換 branch", style=discord.ButtonStyle.secondary,
+                       custom_id="todo_dispatch:change_branch")
+    async def change_branch_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._load(interaction):
+            await interaction.response.edit_message(content=_EXPIRED_MSG, view=None)
+            return
+        print(f"[TODO_DISPATCH] change_branch pressed by {interaction.user}", flush=True)
+
+        # Show a modal to collect the correct branch name
+        modal = _BranchInputModal(
+            message_id=interaction.message.id,
+            current_branch=self.base_branch,
+        )
+        await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="⏭️ 跳過", style=discord.ButtonStyle.secondary,
                        custom_id="todo_dispatch:skip")
@@ -2021,6 +2332,56 @@ class TodoDispatchView(discord.ui.View):
             await interaction.response.edit_message(view=self)
         except discord.NotFound:
             pass
+
+
+class _BranchInputModal(discord.ui.Modal, title="指定 base branch"):
+    """Modal that lets the user correct the auto-detected branch before dispatch."""
+
+    branch_input = discord.ui.TextInput(
+        label="Branch name",
+        placeholder="例如 feature/caplin_gloas_rebase",
+        required=True,
+        max_length=200,
+    )
+
+    def __init__(self, message_id: int, current_branch: str | None = None):
+        super().__init__()
+        self._dispatch_msg_id = message_id
+        if current_branch:
+            self.branch_input.default = current_branch
+
+    async def on_submit(self, interaction: discord.Interaction):
+        data = _todo_dispatch_data.get(self._dispatch_msg_id)
+        if not data:
+            await interaction.response.send_message("⚠️ 資料已過期，請重新發問。", ephemeral=True)
+            return
+
+        new_branch = self.branch_input.value.strip()
+        if not new_branch:
+            await interaction.response.send_message("⚠️ Branch 不能是空的。", ephemeral=True)
+            return
+
+        # Update stored data with the corrected branch
+        data["base_branch"] = new_branch
+        print(f"[TODO_DISPATCH] branch corrected to: {new_branch}", flush=True)
+
+        # Disable buttons on the original message
+        try:
+            orig_msg = await interaction.channel.fetch_message(self._dispatch_msg_id)
+            await orig_msg.edit(view=None)
+        except Exception:
+            pass
+
+        _todo_dispatch_data.pop(self._dispatch_msg_id, None)
+
+        await interaction.response.send_message(
+            f"🌿 Branch 已更新為 `{new_branch}`，開始 dispatch...",
+        )
+        asyncio.create_task(_run_todo_dispatch(
+            todos=data["todos"], cwd=data["cwd"], channel=interaction.channel,
+            base_pikmin_idx=data["base_pikmin_idx"],
+            base_branch=new_branch,
+        ))
 
 
 _plan_data: dict[int, dict] = {}
@@ -2299,6 +2660,7 @@ def _build_judge_context(config: dict, history: list[dict], open_incident: dict 
 
     context = {
         "service": service,
+        "purpose": config.get("check_instruction", ""),
         "readings": readings,
         "has_open_incident": bool(open_incident),
     }
@@ -2322,13 +2684,21 @@ def _parse_judge_result(result: str) -> dict:
 
 
 JUDGE_PROMPT_TEMPLATE = (
-    "你是 {service} 的監控判斷助手。根據以下結構化數據判斷是否有異常。\n\n"
-    "{context_json}\n\n"
+    "你是 {service} 的監控判斷助手。\n\n"
+    "## 監控目的\n"
+    "context 中的 `purpose` 欄位描述了使用者建立這個監控的意圖和關注點。\n"
+    "你的判斷標準必須對齊這個意圖：\n"
+    "- 如果 purpose 是偵測異常（CPU/memory/sync 等）→ 判斷數據是否有問題、趨勢是否異常\n"
+    "- 如果 purpose 是掃描工作項目（bug/issue/task 等）→ 判斷是否有值得報告或行動的發現\n"
+    "- 看 readings 之間的**變化趨勢**，不只看單一數值。例如 memory 持續上升 = 潛在 leak，"
+    "peer 數量持續下降 = 網路問題\n\n"
+    "## 數據\n{context_json}\n\n"
     "回覆一個 JSON object（不要 markdown code fence）：\n"
     '{{"anomaly": true/false, "summary": "簡短描述（繁體中文）", '
     '"details": "詳細分析（繁體中文）", '
     '"confidence": "high/medium/low", '
     '"lesson": "新學到的知識 or null"}}\n\n'
+    "anomaly=true 代表「有需要報告給使用者的事項」，不限於故障，也包含 purpose 中描述的任何觸發條件。\n\n"
     "confidence 說明：\n"
     "- high: 數據明確，判斷有把握\n"
     "- medium: 有些跡象但不確定，可能需要更多數據\n"
@@ -2337,6 +2707,8 @@ JUDGE_PROMPT_TEMPLATE = (
 
 ESCALATE_PROMPT_TEMPLATE = (
     "你是 {service} 的資深監控分析師。Haiku 初步判斷的 confidence 為 low，需要你做深度分析。\n\n"
+    "context 中的 `purpose` 欄位描述了使用者的監控意圖，你的判斷必須對齊這個意圖。\n"
+    "anomaly=true 代表「有需要報告給使用者的事項」，不限於故障。\n\n"
     "=== Haiku 的初步判斷 ===\n{haiku_result}\n\n"
     "=== 完整監控數據 ===\n{context_json}\n\n"
     "請仔細分析所有 signals 和 metrics 的趨勢，做出最終判斷。\n"
@@ -2629,8 +3001,20 @@ async def monitor_loop(monitor_id: str, channel):
     # If check_commands exists, always use Claude (it was generated by Claude's analysis)
     use_claude_collect = bool(config.get("check_commands"))
 
+    # Calculate initial sleep: if enough time has elapsed since last check,
+    # run immediately instead of waiting a full interval. This prevents
+    # long-interval monitors (e.g., 24h) from never firing when the bot
+    # restarts more frequently than the interval.
+    last_check_ts = config.get("last_check_ts", 0)
+    elapsed = time.time() - last_check_ts if last_check_ts else float("inf")
+    initial_sleep = max(check_interval - elapsed, 0)
+    if initial_sleep > 0:
+        print(f"[MONITOR] {config['name']} sleeping {initial_sleep:.0f}s "
+              f"(last check {elapsed:.0f}s ago)", flush=True)
+
     while True:
-        await asyncio.sleep(check_interval)
+        await asyncio.sleep(initial_sleep)
+        initial_sleep = check_interval  # subsequent iterations use full interval
         try:
             # ── Step 1: Collect (fresh Claude session, structured output) ──
             if use_claude_collect:
@@ -2712,6 +3096,10 @@ async def monitor_loop(monitor_id: str, channel):
                 else:
                     summary_text += "✅ 一切正常\n"
                 await pikmin_send(channel, summary_text, pikmin)
+
+            # Record last check time so restarts can calculate remaining sleep
+            config["last_check_ts"] = time.time()
+            _save_monitors()
 
             print(
                 f"[MONITOR] {config['name']} {time.strftime('%H:%M:%S')} - "
@@ -3938,6 +4326,34 @@ async def on_message(message: discord.Message):
         cwd = channel_workdir.get(message.channel.id, WORK_ROOT)
         session_id = channel_session.get(message.channel.id)
 
+        # ── Branch-mention auto-switch: if the prompt names a real git branch,
+        # pin this channel to that branch's worktree so threads don't share HEAD.
+        branch_candidates = BRANCH_NAME_RE.findall(prompt)
+        if branch_candidates:
+            main_repo = await find_main_repo_path(cwd)
+            if main_repo:
+                picked_branch = None
+                for cand in branch_candidates:
+                    if await branch_exists(main_repo, cand):
+                        picked_branch = cand
+                        break
+                if picked_branch:
+                    wt = await ensure_worktree_for_branch(main_repo, picked_branch)
+                    if wt and os.path.realpath(wt) != os.path.realpath(cwd):
+                        print(f"[BRANCH] switching channel {message.channel.id} cwd: {cwd} -> {wt} (branch {picked_branch})", flush=True)
+                        channel_workdir[message.channel.id] = wt
+                        channel_session[message.channel.id] = None
+                        channel_worktrees[message.channel.id] = {
+                            "repo": main_repo, "worktree": wt, "branch": picked_branch,
+                        }
+                        _save_state()
+                        cwd = wt
+                        session_id = None
+                        try:
+                            await message.channel.send(f"🌿 偵測到分支 `{picked_branch}`，切到 worktree：`{wt}`")
+                        except Exception:
+                            pass
+
         # Only inject cross-thread context on first message (no existing session)
         # When resuming, pass raw prompt to avoid polluting the conversation
         enriched_prompt = prompt
@@ -4077,17 +4493,24 @@ async def on_message(message: discord.Message):
                 if todos:
                     print(f"[TODO_DETECT] found {len(todos)} actionable TODOs", flush=True)
                     base_pidx = pikmin_assignments.get(message.channel.id, 0)
+                    # Pre-detect base branch so the dispatch message can show it
+                    detected_branch = await _detect_base_branch(cwd, message.channel)
+                    if detected_branch:
+                        print(f"[TODO_DETECT] detected base branch: {detected_branch}", flush=True)
                     dispatch_view = TodoDispatchView(
                         todos=todos, cwd=cwd, channel=message.channel,
                         base_pikmin_idx=base_pidx,
+                        base_branch=detected_branch,
                     )
                     preview = "\n".join(
                         f"**{idx}.** {t[:140]}{'…' if len(t) > 140 else ''}"
                         for idx, t in enumerate(todos, 1)
                     )
+                    branch_hint = f"\n🌿 偵測到 branch：`{detected_branch}`" if detected_branch else ""
                     dispatch_msg = await message.channel.send(
                         f"📋 **偵測到 {len(todos)} 項 TODO**。要派 subagent 逐項處理嗎？\n"
-                        f"（串行：每項跑 generator + evaluator 到收斂再進下一項）\n\n{preview}",
+                        f"（串行：每項跑 generator + evaluator 到收斂再進下一項）"
+                        f"{branch_hint}\n\n{preview}",
                         view=dispatch_view,
                     )
                     dispatch_view.store(dispatch_msg.id)
@@ -4138,8 +4561,6 @@ async def on_message(message: discord.Message):
                             )
                             if fix_sid:
                                 fix_session = fix_sid
-                                channel_session[message.channel.id] = fix_sid
-                                _save_state()
                             result = fix_result
 
                             fix_chunks = split_message(fix_result)
