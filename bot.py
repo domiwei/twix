@@ -220,6 +220,7 @@ channel_last_usage: dict[int, dict] = {}  # channel_id -> last usage data from C
 # turn. Used by run_evaluator to scope verdict to this turn's delta; prior-turn
 # uncommitted WIP stays as context but is out of verdict scope.
 channel_turn_snapshot: dict[int, str | None] = {}
+_thread_wt_skip: set[int] = set()  # threads where branch detection returned None — skip future attempts
 CONTEXT_WINDOW_TOKENS = 200_000  # Opus context window
 CONTEXT_RELAY_THRESHOLD = int(os.environ.get("CONTEXT_RELAY_THRESHOLD", "80"))
 _channel_locks: dict[int, asyncio.Lock] = {}  # per-channel lock to prevent concurrent processing
@@ -2081,6 +2082,215 @@ async def _detect_base_branch(cwd: str, channel) -> str | None:
     return None
 
 
+async def _switch_worktree_branch(wt_path: str, main_repo: str, branch: str) -> tuple[bool, bool]:
+    """Switch an existing worktree to a different branch.
+
+    Returns (success, stashed). When stashed=True, caller should notify the
+    user that uncommitted changes were saved to git stash.
+    """
+    # Fetch latest from origin
+    fetch = await asyncio.create_subprocess_exec(
+        "git", "fetch", "origin", branch,
+        cwd=wt_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        await asyncio.wait_for(fetch.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        try:
+            fetch.kill()
+            await fetch.wait()
+        except Exception:
+            pass
+
+    # Stash any dirty state so it doesn't leak into the new branch
+    status_proc = await asyncio.create_subprocess_exec(
+        "git", "status", "--porcelain",
+        cwd=wt_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    status_out, _ = await status_proc.communicate()
+    stashed = False
+    if status_out and status_out.strip():
+        stash_proc = await asyncio.create_subprocess_exec(
+            "git", "stash", "push", "-u", "-m", f"auto-stash before switch to {branch}",
+            cwd=wt_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stash_out, _ = await stash_proc.communicate()
+        # -u includes untracked files; rc=0 means something was actually stashed
+        stashed = stash_proc.returncode == 0 and b"No local changes" not in stash_out
+        if stashed:
+            print(f"[THREAD_WT] stashed dirty state before switching to {branch}", flush=True)
+
+    # Try normal checkout first
+    proc = await asyncio.create_subprocess_exec(
+        "git", "checkout", branch,
+        cwd=wt_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode == 0:
+        return True, stashed
+
+    # Branch might be checked out elsewhere — try detached HEAD
+    for ref in [f"origin/{branch}", branch]:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", "--detach", ref,
+            cwd=wt_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+        if proc.returncode == 0:
+            return True, stashed
+
+    # Switch failed — restore stashed changes
+    if stashed:
+        restore = await asyncio.create_subprocess_exec(
+            "git", "stash", "pop",
+            cwd=wt_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await restore.communicate()
+
+    print(f"[THREAD_WT] switch to {branch} failed in {wt_path}", flush=True)
+    return False, False
+
+
+async def _ensure_thread_worktree(channel, cwd: str) -> tuple[str, str | None, bool]:
+    """Auto-create an isolated worktree for a Discord thread.
+
+    Only acts on threads in git repos where a branch is detectable from
+    conversation context. Returns (effective_cwd, branch_name, newly_created).
+    """
+    if not isinstance(channel, discord.Thread):
+        return cwd, None, False
+
+    # Already has a worktree — validate it still exists
+    wt_info = channel_worktrees.get(channel.id)
+    if wt_info:
+        if os.path.isdir(wt_info["worktree"]):
+            return wt_info["worktree"], wt_info.get("branch"), False
+        # Stale entry — clean up
+        del channel_worktrees[channel.id]
+        _save_state()
+
+    # Detect which branch this conversation is about
+    branch = await _detect_base_branch(cwd, channel)
+    if not branch:
+        return cwd, None, False
+
+    main_repo = await find_main_repo_path(cwd)
+    if not main_repo:
+        return cwd, branch, False  # branch detected but no git repo — retryable
+
+    # Fetch so recently-pushed branches are available locally
+    fetch = await asyncio.create_subprocess_exec(
+        "git", "fetch", "origin", branch,
+        cwd=main_repo, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        await asyncio.wait_for(fetch.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        try:
+            fetch.kill()
+            await fetch.wait()
+        except Exception:
+            pass
+
+    # Try standard worktree approach (reuse existing worktree for this branch)
+    # But only if no other channel already claims it — otherwise we'd share state.
+    wt_path = await ensure_worktree_for_branch(main_repo, branch)
+    if wt_path and os.path.realpath(wt_path) != os.path.realpath(main_repo):
+        # Check no other channel already owns this worktree
+        wt_real = os.path.realpath(wt_path)
+        claimed = any(
+            os.path.realpath(v.get("worktree", "")) == wt_real
+            for ch_id, v in channel_worktrees.items()
+            if ch_id != channel.id
+        )
+        if not claimed:
+            channel_workdir[channel.id] = wt_path
+            channel_worktrees[channel.id] = {
+                "repo": main_repo, "worktree": wt_path, "branch": branch,
+            }
+            _save_state()
+            return wt_path, branch, True
+
+    # Branch is checked out in main repo or worktree is claimed — create a
+    # per-thread detached copy for isolation.
+    repo_name = os.path.basename(main_repo)
+    thread_suffix = str(channel.id)[-6:]
+    dir_slug = branch.replace("/", "-")
+    wt_path = os.path.join(WORK_ROOT, f"{repo_name}-wt-t{thread_suffix}-{dir_slug}")
+
+    if os.path.exists(wt_path):
+        # Leftover from previous session — validate it is a functional git worktree
+        check = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--git-dir",
+            cwd=wt_path, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await check.communicate()
+        if check.returncode == 0:
+            # Verify not claimed by another channel
+            wt_real = os.path.realpath(wt_path)
+            claimed = any(
+                os.path.realpath(v.get("worktree", "")) == wt_real
+                for ch_id, v in channel_worktrees.items()
+                if ch_id != channel.id
+            )
+            if not claimed:
+                # Update to the correct branch HEAD (leftover may be on stale commit)
+                updated = False
+                for ref in [f"origin/{branch}", branch]:
+                    up = await asyncio.create_subprocess_exec(
+                        "git", "checkout", "--detach", ref,
+                        cwd=wt_path, stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await up.communicate()
+                    if up.returncode == 0:
+                        updated = True
+                        break
+                if updated:
+                    channel_workdir[channel.id] = wt_path
+                    channel_worktrees[channel.id] = {
+                        "repo": main_repo, "worktree": wt_path, "branch": branch,
+                    }
+                    _save_state()
+                    return wt_path, branch, True
+                # Checkout failed — fall through to prune+recreate
+        # Invalid or claimed leftover — prune stale worktree metadata, then remove
+        prune = await asyncio.create_subprocess_exec(
+            "git", "worktree", "prune",
+            cwd=main_repo, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await prune.communicate()
+        shutil.rmtree(wt_path, ignore_errors=True)
+
+    # Resolve ref: local branch commit → detached HEAD (avoids branch-in-use conflict)
+    proc = await asyncio.create_subprocess_exec(
+        "git", "worktree", "add", "--detach", wt_path, branch,
+        cwd=main_repo,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        # Try origin/<branch>
+        proc2 = await asyncio.create_subprocess_exec(
+            "git", "worktree", "add", "--detach", wt_path, f"origin/{branch}",
+            cwd=main_repo,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr2 = await proc2.communicate()
+        if proc2.returncode != 0:
+            print(f"[THREAD_WT] worktree add failed: {stderr2.decode()[:200]}", flush=True)
+            return cwd, branch, False  # branch detected but creation failed — retryable
+
+    channel_workdir[channel.id] = wt_path
+    channel_worktrees[channel.id] = {
+        "repo": main_repo, "worktree": wt_path, "branch": branch,
+    }
+    _save_state()
+    return wt_path, branch, True
+
+
 async def _create_subagent_worktree(cwd: str,
                                     base_ref: str | None = None,
                                     ) -> tuple[str, str, str, str | None] | None:
@@ -2595,33 +2805,42 @@ JUDGE_MODEL = os.environ.get("JUDGE_MODEL", "claude-haiku-4-5-20251001")
 
 
 async def collect_metrics_via_claude(config: dict) -> dict:
-    """Use Claude to collect metrics. Returns structured JSON dict."""
+    """Use Claude to collect data. Returns structured JSON dict.
+
+    The output format adapts to the monitor's purpose: infrastructure monitors
+    get a metrics-oriented schema, while task/issue scanners get a findings
+    schema. Claude sees the check_instruction and picks the right format.
+    """
     instruction = config.get("check_instruction", "")
     check_commands = config.get("check_commands", "")
     checks = config.get("checks", ["cpu", "memory"])
     service = config["service_name"]
 
     prompt = (
-        f"你是 {service} 的監控助手。請執行以下檢查並收集數據。\n"
-        f"監控描述：{instruction}\n"
-        f"檢查項目：{', '.join(checks)}\n"
+        f"你是 {service} 的監控助手。請根據以下描述執行檢查並收集數據。\n\n"
+        f"## 監控目的\n{instruction}\n\n"
+        f"## 檢查項目\n{', '.join(checks)}\n"
     )
     if check_commands:
-        prompt += f"檢查方式：{check_commands}\n"
+        prompt += f"\n## 檢查方式\n{check_commands}\n"
     if config.get("log_path"):
-        prompt += f"Log 路徑：{config['log_path']}\n"
+        prompt += f"\n## Log 路徑\n{config['log_path']}\n"
     prompt += (
-        "\n請直接執行必要的指令（SSH、curl 等）收集數據。\n"
-        "完成後，回傳一個 JSON object，格式如下（不要包含 markdown code fence）：\n"
+        "\n請直接執行必要的指令（SSH、curl、gh 等）收集數據。\n\n"
+        "完成後，根據監控目的選擇合適的 JSON 格式回傳（不要包含 markdown code fence）：\n\n"
+        "**如果是基礎設施監控**（CPU/memory/process/sync 等）：\n"
         '{"metrics": {"cpu_percent": <number or null>, "memory_mb": <number or null>, '
         '"disk_percent": <number or null>, "process_running": <true/false>, '
         '"sync_status": "<描述 or null>", "peer_count": <number or null>, '
         '"block_height": <number or null>, "error_count": <number or null>}, '
-        '"signals": ["<觀察到的趨勢或異常跡象，每條一句話>"], '
-        '"raw_notes": "<其他值得注意的觀察，100字以內>"}\n'
-        "signals 欄位很重要：把你在收集過程中注意到的任何趨勢、變化、或可疑跡象寫在這裡。"
-        "例如：「memory 比上次增加 500MB」、「log 有 3 次 reorg 但都 recover」、「peer 數量偏低」。"
-        "即使整體正常，也可以記錄觀察。沒有觀察就留空 array。\n"
+        '"signals": ["<觀察到的趨勢或異常跡象>"], '
+        '"raw_notes": "<其他觀察>"}\n\n'
+        "**如果是任務掃描**（bug scan、issue triage、code audit 等）：\n"
+        '{"findings": [{"title": "<簡述>", "severity": "high/medium/low", '
+        '"effort": "trivial/small/medium/large", "details": "<詳細描述>"}], '
+        '"signals": ["<觀察到的趨勢>"], '
+        '"raw_notes": "<其他觀察>"}\n\n'
+        "根據「監控目的」選擇格式。兩種格式都有 signals 和 raw_notes 欄位。\n"
         "只回傳 JSON，不要加其他文字。缺少的欄位用 null。"
     )
 
@@ -2639,8 +2858,8 @@ async def collect_metrics_via_claude(config: dict) -> dict:
             return json.loads(cleaned[start:end + 1])
     except (json.JSONDecodeError, TypeError):
         pass
-    # Fallback: wrap raw text
-    return {"metrics": {}, "raw_notes": result[:500]}
+    # Fallback: wrap raw text (shape-neutral — no assumed metrics/findings key)
+    return {"raw_notes": result[:500]}
 
 
 def _build_judge_context(config: dict, history: list[dict], open_incident: dict | None) -> dict:
@@ -2711,7 +2930,7 @@ ESCALATE_PROMPT_TEMPLATE = (
     "anomaly=true 代表「有需要報告給使用者的事項」，不限於故障。\n\n"
     "=== Haiku 的初步判斷 ===\n{haiku_result}\n\n"
     "=== 完整監控數據 ===\n{context_json}\n\n"
-    "請仔細分析所有 signals 和 metrics 的趨勢，做出最終判斷。\n"
+    "請仔細分析所有 signals、metrics 或 findings 的趨勢，做出最終判斷。\n"
     "回覆 JSON（不要 markdown code fence）：\n"
     '{{"anomaly": true/false, "summary": "簡短描述（繁體中文）", '
     '"details": "詳細分析（繁體中文）", '
@@ -2732,6 +2951,7 @@ async def judge_metrics(config: dict, history: list[dict], open_incident: dict |
         "-p", prompt,
         "--model", JUDGE_MODEL,
         "--output-format", "stream-json",
+        "--verbose",
         "--max-turns", "1",
     ]
     result, _, _, _, _ = await _run_claude_stream(cmd, config.get("project_path", WORK_ROOT))
@@ -2752,6 +2972,7 @@ async def judge_metrics(config: dict, history: list[dict], open_incident: dict |
             "-p", escalate_prompt,
             "--model", CLAUDE_MODEL,
             "--output-format", "stream-json",
+            "--verbose",
             "--max-turns", "1",
         ]
         escalate_result, _, _, _, _ = await _run_claude_stream(escalate_cmd, config.get("project_path", WORK_ROOT))
@@ -3804,6 +4025,7 @@ async def on_message(message: discord.Message):
                 "--model", PLANNER_MODEL,
                 "--system-prompt", PLANNER_PROMPT,
                 "--output-format", "stream-json",
+                "--verbose",
                 "--max-turns", str(MAX_TURNS),
             ]
             result, _, _, _, _ = await _run_claude_stream(cmd, cwd)
@@ -3823,6 +4045,7 @@ async def on_message(message: discord.Message):
                     "--model", PLANNER_MODEL,
                     "--system-prompt", "Output ONLY valid JSON. No markdown, no explanation.",
                     "--output-format", "stream-json",
+                    "--verbose",
                     "--max-turns", "3",
                 ]
                 result2, _, _, _, _ = await _run_claude_stream(cmd_retry, cwd)
@@ -3859,6 +4082,8 @@ async def on_message(message: discord.Message):
                 await remove_worktree(wt_info["repo"], wt_info["worktree"])
                 branch = wt_info["branch"]
                 del channel_worktrees[message.channel.id]
+                # Reset cwd to main repo so future messages don't use deleted path
+                channel_workdir[message.channel.id] = wt_info["repo"]
                 _save_state()
                 await message.reply(f"✅ Worktree 已清理。Branch `{branch}` 保留在 repo 中，可以用來開 PR。")
             except Exception as e:
@@ -4236,6 +4461,8 @@ async def on_message(message: discord.Message):
             await remove_worktree(wt_info["repo"], wt_info["worktree"])
             branch = wt_info["branch"]
             del channel_worktrees[message.channel.id]
+            # Reset cwd to main repo so future messages don't use deleted path
+            channel_workdir[message.channel.id] = wt_info["repo"]
             _save_state()
             await message.reply(f"✅ Worktree 已清理。Branch `{branch}` 保留在 repo 中，可以用來開 PR。")
         except Exception as e:
@@ -4338,21 +4565,68 @@ async def on_message(message: discord.Message):
                         picked_branch = cand
                         break
                 if picked_branch:
-                    wt = await ensure_worktree_for_branch(main_repo, picked_branch)
-                    if wt and os.path.realpath(wt) != os.path.realpath(cwd):
-                        print(f"[BRANCH] switching channel {message.channel.id} cwd: {cwd} -> {wt} (branch {picked_branch})", flush=True)
-                        channel_workdir[message.channel.id] = wt
-                        channel_session[message.channel.id] = None
-                        channel_worktrees[message.channel.id] = {
-                            "repo": main_repo, "worktree": wt, "branch": picked_branch,
-                        }
-                        _save_state()
-                        cwd = wt
-                        session_id = None
-                        try:
-                            await message.channel.send(f"🌿 偵測到分支 `{picked_branch}`，切到 worktree：`{wt}`")
-                        except Exception:
-                            pass
+                    existing_wt = channel_worktrees.get(message.channel.id)
+                    old_branch = existing_wt.get("branch") if existing_wt else None
+                    if old_branch and old_branch != picked_branch:
+                        # Thread already has a worktree — switch branch in-place
+                        switched, was_stashed = await _switch_worktree_branch(
+                            existing_wt["worktree"], main_repo, picked_branch,
+                        )
+                        if switched:
+                            print(f"[BRANCH] in-place switch {old_branch} -> {picked_branch} in {existing_wt['worktree']}", flush=True)
+                            channel_worktrees[message.channel.id]["branch"] = picked_branch
+                            channel_session[message.channel.id] = None
+                            _save_state()
+                            session_id = None
+                            try:
+                                notice = f"🔀 `{old_branch}` → `{picked_branch}`"
+                                if was_stashed:
+                                    notice += f"\n📦 `{old_branch}` 上的未 commit 改動已存入 `git stash`"
+                                await message.channel.send(notice)
+                            except Exception:
+                                pass
+                    elif not existing_wt:
+                        # No worktree yet — create/find one
+                        wt = await ensure_worktree_for_branch(main_repo, picked_branch)
+                        if wt and os.path.realpath(wt) != os.path.realpath(cwd):
+                            print(f"[BRANCH] switching channel {message.channel.id} cwd: {cwd} -> {wt} (branch {picked_branch})", flush=True)
+                            channel_workdir[message.channel.id] = wt
+                            channel_session[message.channel.id] = None
+                            channel_worktrees[message.channel.id] = {
+                                "repo": main_repo, "worktree": wt, "branch": picked_branch,
+                            }
+                            _save_state()
+                            _thread_wt_skip.discard(message.channel.id)
+                            cwd = wt
+                            session_id = None
+                            try:
+                                await message.channel.send(f"🔀 已切換至 `{picked_branch}` · `{wt}`")
+                            except Exception:
+                                pass
+
+        # ── Auto-create isolated worktree for threads ──
+        if (isinstance(message.channel, discord.Thread)
+                and message.channel.id not in channel_worktrees
+                and message.channel.id not in _thread_wt_skip):
+            new_cwd, wt_branch, created = await _ensure_thread_worktree(
+                message.channel, cwd,
+            )
+            if created:
+                print(f"[THREAD_WT] auto-created worktree for thread {message.channel.id}: {new_cwd} (branch {wt_branch})", flush=True)
+                cwd = new_cwd
+                session_id = None
+                channel_session[message.channel.id] = None
+                try:
+                    await message.channel.send(
+                        f"🔀 已為此 thread 建立工作區\n📌 `{wt_branch}` · `{new_cwd}`"
+                    )
+                except Exception:
+                    pass
+            elif wt_branch is None:
+                # No branch detected — skip future auto-detect attempts.
+                # (Don't skip when branch was found but worktree creation failed —
+                # that could be a transient error worth retrying.)
+                _thread_wt_skip.add(message.channel.id)
 
         # Only inject cross-thread context on first message (no existing session)
         # When resuming, pass raw prompt to avoid polluting the conversation
@@ -4432,7 +4706,11 @@ async def on_message(message: discord.Message):
                 channel_session[message.channel.id] = new_session_id
                 _save_state()
 
-            if detected:
+            # Branch indicator (worktree) takes priority over cwd indicator (project detect)
+            wt_info = channel_worktrees.get(message.channel.id)
+            if wt_info:
+                result = f"📌 `{wt_info['branch']}`\n\n{result}"
+            elif detected:
                 result = f"📂 `{cwd}`\n\n{result}"
 
             wrote_code = _has_write_tools(tools_used)
