@@ -242,7 +242,7 @@ channel_last_usage: dict[int, dict] = {}  # channel_id -> last usage data from C
 # uncommitted WIP stays as context but is out of verdict scope.
 channel_turn_snapshot: dict[int, str | None] = {}
 _thread_wt_skip: set[int] = set()  # threads where branch detection returned None — skip future attempts
-CONTEXT_WINDOW_TOKENS = 200_000  # Opus context window
+CONTEXT_WINDOW_TOKENS = 1_000_000  # Opus 4.6+ context window
 CONTEXT_RELAY_THRESHOLD = int(os.environ.get("CONTEXT_RELAY_THRESHOLD", "80"))
 _channel_locks: dict[int, asyncio.Lock] = {}  # per-channel lock to prevent concurrent processing
 _cwd_locks: dict[str, asyncio.Lock] = {}  # per-cwd lock: two threads on the same working dir serialize
@@ -2137,20 +2137,10 @@ async def _detect_base_branch(cwd: str, channel) -> str | None:
     if wt_info:
         return wt_info.get("branch")
 
-    # 2. cwd's current git branch (fast, no network)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git", "rev-parse", "--abbrev-ref", "HEAD",
-            cwd=cwd, stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-        if proc.returncode == 0:
-            branch = out.decode("utf-8", errors="replace").strip()
-            if branch and branch not in ("main", "master", "HEAD"):
-                return branch
-    except Exception:
-        pass
+    # Step 2 (cwd current branch) intentionally removed:
+    # The repo's HEAD may reflect a previous unrelated operation, causing all
+    # new threads to be assigned to the wrong worktree. Branch must be
+    # explicitly mentioned in messages (step 3) to be trustworthy.
 
     # 3. Scan recent messages for branch-like patterns
     _branch_re = re.compile(
