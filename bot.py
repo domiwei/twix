@@ -38,6 +38,27 @@ PIKMIN_POOL = [
 ]
 
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-6")
+CLAUDE_BACKUP_HOME = os.environ.get("CLAUDE_BACKUP_HOME", "")
+_account_mode: str = "primary"  # "primary" or "backup"
+
+_USAGE_LIMIT_PATTERNS = [
+    "usage limit reached", "usage_limit_reached", "Usage Limit",
+    "exceeded your usage", "upgrade your plan", "Your account has",
+    "free usage", "monthly limit", "quota exceeded", "rate_limit_error",
+    "Claude.ai Usage", "usage has been exceeded",
+]
+
+
+def _get_account_env() -> dict | None:
+    if _account_mode == "backup" and CLAUDE_BACKUP_HOME:
+        return {"HOME": CLAUDE_BACKUP_HOME}
+    return None
+
+
+def _is_limit_text(text: str) -> bool:
+    t = text.lower()
+    return any(p.lower() in t for p in _USAGE_LIMIT_PATTERNS)
+
 
 # ── Prompt loading ──────────────────────────────────────────────────────────
 # Prompts live in prompts/*.md — edit those files to change agent behavior
@@ -675,10 +696,12 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "7200"))  # 2h default —
 EVALUATOR_TIMEOUT = int(os.environ.get("EVALUATOR_TIMEOUT", "1800"))  # 30m default — evaluator / review passes
 
 
-async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout: int | None = None) -> tuple[str, str | None, list[str], int, dict]:
+async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout: int | None = None, env_override: dict | None = None) -> tuple[str, str | None, list[str], int, dict, bool]:
+    env = {**os.environ, **(env_override or {})}
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=1024 * 1024,  # 1MB line buffer (default 64KB too small for large tool output)
@@ -690,6 +713,8 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout:
     assistant_texts: list[str] = []  # collect text blocks as fallback
     usage_data: dict = {}  # token usage from result event
     num_turns = 0
+    is_limit_error = False
+    stderr_lines: list[str] = []
     current_status = "🤔 思考中..."
     last_update = 0.0
     UPDATE_INTERVAL = 2.0
@@ -712,8 +737,18 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout:
             except Exception:
                 pass
 
+    async def read_stderr():
+        while True:
+            line = await proc.stderr.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                stderr_lines.append(text)
+                print(f"[CLAUDE STDERR] {text[:200]}", flush=True)
+
     async def read_events():
-        nonlocal result_text, session_id
+        nonlocal result_text, session_id, is_limit_error
         while True:
             line = await proc.stdout.readline()
             if not line:
@@ -725,10 +760,17 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout:
                 event = json.loads(text)
             except json.JSONDecodeError:
                 print(f"[CLAUDE] {text}", flush=True)
+                if _is_limit_text(text):
+                    is_limit_error = True
                 continue
 
             etype = event.get("type", "")
-            if etype == "assistant":
+            if etype == "error":
+                err_str = json.dumps(event.get("error", event))
+                print(f"[CLAUDE] error event: {err_str[:200]}", flush=True)
+                if _is_limit_text(err_str):
+                    is_limit_error = True
+            elif etype == "assistant":
                 msg = event.get("message", {})
                 block_types = [b.get("type") for b in msg.get("content", []) if isinstance(b, dict)]
                 print(f"[CLAUDE] assistant event: blocks={block_types}", flush=True)
@@ -754,19 +796,32 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout:
                 cost = event.get("total_cost_usd", 0)
                 num_turns = event.get("num_turns", 0)
                 usage_data = event.get("usage", {})
+                if event.get("is_error") and _is_limit_text(result_text):
+                    is_limit_error = True
                 print(f"[CLAUDE] done: {num_turns} turns, ${cost:.4f}, result_len={len(result_text)}, input_tokens={usage_data.get('input_tokens', '?')}", flush=True)
                 return  # Don't wait for EOF — child processes may keep stdout open
 
     async def _do_stream():
         events_task = asyncio.create_task(read_events())
-        stderr_task = asyncio.create_task(proc.stderr.read())
+        stderr_task = asyncio.create_task(read_stderr())
         # Wait for events (returns when result event received or EOF)
         await events_task
-        # Don't wait for stderr/proc — child processes (e.g. http.server) may keep pipes open
+        # Don't wait for stderr — child processes (e.g. http.server) may keep pipes open
         stderr_task.cancel()
+        # Ensure the Claude process is fully stopped before we return.
+        # Without this, background tasks (e.g. bash monitor scripts) keep
+        # the process alive, and the next --resume spawns a competing
+        # process on the same session — corrupting context.
         try:
-            await asyncio.wait_for(proc.wait(), timeout=5)
-        except (asyncio.TimeoutError, Exception):
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            print(f"[CLAUDE] process still alive after result, killing pid={proc.pid}", flush=True)
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+        except Exception:
             pass
 
     effective_timeout = timeout if timeout is not None else CLAUDE_TIMEOUT
@@ -792,17 +847,19 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout:
         await proc.wait()
         raise
 
-    # stream-json: result field often only contains the last turn's text,
-    # which may be a short "done" message while the real analysis is in earlier turns.
-    # Strategy: if result is suspiciously short but we have longer assistant texts, use those.
+    # stream-json: result field often only contains the LAST turn's text,
+    # which may be a short progress note while the real answer is in earlier turns.
+    # Strategy: if all_assistant_text is meaningfully longer, use it — it contains
+    # the complete response the user would see in an interactive session.
     all_assistant_text = "\n\n".join(assistant_texts) if assistant_texts else ""
     if not result_text:
         result_text = all_assistant_text
         if result_text:
             print(f"[CLAUDE] result empty, using all assistant_texts (len={len(result_text)})", flush=True)
-    elif len(result_text) < 100 and len(all_assistant_text) > len(result_text) * 2:
-        # result exists but is very short, and we have much more text from earlier turns
-        print(f"[CLAUDE] result too short ({len(result_text)} chars), using all assistant_texts ({len(all_assistant_text)} chars)", flush=True)
+    elif all_assistant_text and len(all_assistant_text) > len(result_text) * 2:
+        # all_assistant_text has substantially more content — result likely
+        # only captured the last turn's text, not the full response.
+        print(f"[CLAUDE] result partial ({len(result_text)} chars), using all assistant_texts ({len(all_assistant_text)} chars)", flush=True)
         result_text = all_assistant_text
 
     # Last resort: ask Claude to summarize via --resume
@@ -830,7 +887,14 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout:
     if not result_text:
         print(f"[CLAUDE] WARNING: no result from any source", flush=True)
 
-    return result_text, session_id, tools_used, num_turns, usage_data
+    # Check stderr for usage limit signals
+    if not is_limit_error and stderr_lines:
+        stderr_combined = "\n".join(stderr_lines)
+        if _is_limit_text(stderr_combined):
+            is_limit_error = True
+            print(f"[CLAUDE] usage limit detected in stderr", flush=True)
+
+    return result_text, session_id, tools_used, num_turns, usage_data, is_limit_error
 
 
 async def fetch_thread_history(channel, limit: int = 20, max_chars: int = 8000) -> str:
@@ -851,6 +915,36 @@ async def fetch_thread_history(channel, limit: int = 20, max_chars: int = 8000) 
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
 
 
+async def _kill_stale_session_procs(session_id: str) -> None:
+    """Kill any Claude CLI processes still --resume-ing this session.
+
+    This handles the case where a previous bot instance (or a timed-out run
+    whose process wasn't fully reaped) left a zombie Claude process attached
+    to the same session JSONL. Without cleanup, two writers on one session
+    corrupt the conversation context.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pgrep", "-f", f"--resume {session_id}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        if not out:
+            return
+        my_pid = str(os.getpid())
+        for line in out.decode().strip().split("\n"):
+            pid = line.strip()
+            if pid and pid != my_pid:
+                print(f"[CLAUDE] killing stale session process pid={pid} session={session_id}", flush=True)
+                try:
+                    os.kill(int(pid), 9)
+                except (ProcessLookupError, ValueError):
+                    pass
+    except Exception as e:
+        print(f"[CLAUDE] _kill_stale_session_procs error: {e}", flush=True)
+
+
 async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
                      status_msg=None, channel=None, system_prompt: str | None = None) -> tuple[str, str | None, list[str], int, dict]:
     sys_prompt = system_prompt or SYSTEM_PROMPT
@@ -866,6 +960,10 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
     ]
     if session_id:
         cmd.extend(["--resume", session_id])
+        # Kill any leftover Claude process that is still --resume-ing this
+        # session (e.g. from before a bot restart when in-memory locks were
+        # lost). Without this, two processes write to the same session JSONL.
+        await _kill_stale_session_procs(session_id)
 
     # cwd-level lock: two threads/channels that land on the same working dir
     # must serialize their Claude runs or they'll stomp on each other's git state.
@@ -876,7 +974,20 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
         if channel is not None:
             channel_turn_snapshot[channel.id] = await _git_stash_snapshot(cwd)
 
-        result, new_session_id, tools, turns, usage = await _run_claude_stream(cmd, cwd, status_msg)
+        result, new_session_id, tools, turns, usage, is_limit = await _run_claude_stream(cmd, cwd, status_msg, env_override=_get_account_env())
+
+        # If primary account hit usage limit, switch to backup and retry
+        if is_limit and CLAUDE_BACKUP_HOME:
+            global _account_mode
+            if _account_mode == "primary":
+                _account_mode = "backup"
+                print(f"[CLAUDE] usage limit on primary — switching to backup (HOME={CLAUDE_BACKUP_HOME})", flush=True)
+                if channel:
+                    try:
+                        await channel.send("⚠️ 主帳號已達用量上限，切換備用帳號重試...")
+                    except Exception:
+                        pass
+            result, new_session_id, tools, turns, usage, _ = await _run_claude_stream(cmd, cwd, status_msg, env_override={"HOME": CLAUDE_BACKUP_HOME})
 
         # If resume failed, rebuild context from thread history
         if session_id and not result:
@@ -899,7 +1010,7 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
                 "--verbose",
                 "--max-turns", str(MAX_TURNS),
             ]
-            result, new_session_id, tools, turns, usage = await _run_claude_stream(cmd_retry, cwd, status_msg)
+            result, new_session_id, tools, turns, usage, _ = await _run_claude_stream(cmd_retry, cwd, status_msg, env_override=_get_account_env())
 
     # Track session activity timestamp
     if new_session_id and channel:
@@ -1272,7 +1383,7 @@ async def _run_evaluator_claude(eval_prompt: str, cwd: str) -> str:
         "--max-turns", "5",
         "--allowedTools", "Read", "Grep", "Glob", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)",
     ]
-    result, session_id, _, _, _ = await _run_claude_stream(cmd, cwd, timeout=EVALUATOR_TIMEOUT)
+    result, session_id, _, _, _, _ = await _run_claude_stream(cmd, cwd, timeout=EVALUATOR_TIMEOUT)
 
     # If result is missing verdict, resume and ask
     has_verdict = result and _parse_verdict(result) != "PASS"
@@ -1797,7 +1908,7 @@ async def generate_plan(task: str, cwd: str, channel=None) -> dict | None:
         "--verbose",
         "--max-turns", str(MAX_TURNS),
     ]
-    result, _, _, _, _ = await _run_claude_stream(cmd, cwd)
+    result, _, _, _, _, _ = await _run_claude_stream(cmd, cwd)
     if not result:
         return None
     return _extract_plan_json(result)
@@ -2954,7 +3065,7 @@ async def judge_metrics(config: dict, history: list[dict], open_incident: dict |
         "--verbose",
         "--max-turns", "1",
     ]
-    result, _, _, _, _ = await _run_claude_stream(cmd, config.get("project_path", WORK_ROOT))
+    result, _, _, _, _, _ = await _run_claude_stream(cmd, config.get("project_path", WORK_ROOT))
     analysis = _parse_judge_result(result or "")
 
     confidence = analysis.get("confidence", "high")
@@ -2975,7 +3086,7 @@ async def judge_metrics(config: dict, history: list[dict], open_incident: dict |
             "--verbose",
             "--max-turns", "1",
         ]
-        escalate_result, _, _, _, _ = await _run_claude_stream(escalate_cmd, config.get("project_path", WORK_ROOT))
+        escalate_result, _, _, _, _, _ = await _run_claude_stream(escalate_cmd, config.get("project_path", WORK_ROOT))
         opus_analysis = _parse_judge_result(escalate_result or "")
         print(f"[JUDGE] {config['name']} Opus verdict: anomaly={opus_analysis.get('anomaly')}", flush=True)
         return opus_analysis
@@ -3949,6 +4060,27 @@ async def on_message(message: discord.Message):
         await message.reply("✅ 對話已重置（含歷史摘要）")
         return
 
+    if content.startswith("!account"):
+        global _account_mode
+        arg = content[8:].strip().lower()
+        if arg == "primary":
+            _account_mode = "primary"
+            await message.reply("✅ 已切換回主帳號")
+        elif arg == "backup":
+            if not CLAUDE_BACKUP_HOME:
+                await message.reply("❌ 尚未設定 `CLAUDE_BACKUP_HOME` 環境變數")
+            else:
+                _account_mode = "backup"
+                await message.reply(f"✅ 已切換至備用帳號（HOME={CLAUDE_BACKUP_HOME}）")
+        else:
+            status = f"目前使用：**{_account_mode}** 帳號"
+            if CLAUDE_BACKUP_HOME:
+                status += f"\n備用帳號 HOME：`{CLAUDE_BACKUP_HOME}`"
+            else:
+                status += "\n⚠️ `CLAUDE_BACKUP_HOME` 未設定（無備用帳號）"
+            await message.reply(status)
+        return
+
     if content.startswith("!thread"):
         topic = content[7:].strip() or "Claude 對話"
         try:
@@ -4028,7 +4160,7 @@ async def on_message(message: discord.Message):
                 "--verbose",
                 "--max-turns", str(MAX_TURNS),
             ]
-            result, _, _, _, _ = await _run_claude_stream(cmd, cwd)
+            result, _, _, _, _, _ = await _run_claude_stream(cmd, cwd)
             new_plan = None
             if result:
                 new_plan = _extract_plan_json(result)
@@ -4048,7 +4180,7 @@ async def on_message(message: discord.Message):
                     "--verbose",
                     "--max-turns", "3",
                 ]
-                result2, _, _, _, _ = await _run_claude_stream(cmd_retry, cwd)
+                result2, _, _, _, _, _ = await _run_claude_stream(cmd_retry, cwd)
                 if result2:
                     new_plan = _extract_plan_json(result2)
             if new_plan:
