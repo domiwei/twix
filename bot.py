@@ -4913,20 +4913,21 @@ async def on_message(message: discord.Message):
                         enriched_prompt = f"[用戶引用的訊息]\n{ref_msg.content[:3000]}\n\n[用戶的回覆]\n{prompt}"
                 except Exception:
                     pass
-            if not session_id:
-                ctx_parts = []
-                if isinstance(message.channel, discord.Thread):
-                    try:
-                        thread_hist = await fetch_thread_history(message.channel, limit=20, max_chars=8000)
-                        if thread_hist:
-                            ctx_parts.append(f"## 這個 thread 之前的對話\n{thread_hist}")
-                    except Exception:
-                        pass
-                relay_ctx = build_relay_context(message.channel.id)
-                if relay_ctx:
-                    ctx_parts.append(relay_ctx)
-                if ctx_parts:
-                    enriched_prompt = "\n\n---\n".join(ctx_parts) + f"\n\n---\n{prompt}"
+            # Manager always runs in a fresh session, so it needs thread history
+            # injected regardless of whether the channel has an existing session.
+            ctx_parts = []
+            if isinstance(message.channel, discord.Thread):
+                try:
+                    thread_hist = await fetch_thread_history(message.channel, limit=30, max_chars=12000)
+                    if thread_hist:
+                        ctx_parts.append(f"## 這個 thread 之前的對話\n{thread_hist}")
+                except Exception:
+                    pass
+            relay_ctx = build_relay_context(message.channel.id)
+            if relay_ctx:
+                ctx_parts.append(relay_ctx)
+            if ctx_parts:
+                enriched_prompt = "\n\n---\n".join(ctx_parts) + f"\n\n---\n{prompt}"
 
             if pikmin:
                 thinking = await pikmin_send(message.channel, "🤖 Manager 分析任務中...", pikmin)
