@@ -4955,7 +4955,6 @@ async def on_message(message: discord.Message):
                     enriched_prompt, cwd, None,
                     status_msg=thinking,
                     system_prompt=CODING_MANAGER_SYSTEM_PROMPT,
-                    max_turns=15,
                 )
                 print(f"[CODING] manager output: {manager_result[:200]}", flush=True)
 
