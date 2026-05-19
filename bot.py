@@ -4804,11 +4804,19 @@ async def on_message(message: discord.Message):
         if base_match:
             branch = next(g for g in base_match.groups() if g)
             review_args = f"--base {branch}"
+        # Strip common trigger phrases to get the meaningful instruction
+        review_instruction = re.sub(
+            r"(codex\s*)?(幫我\s*)?review\s*(一下|看看|這次改動|這個|這裡|吧|下)?|"
+            r"看看有沒有問題|幫我看看|--base\s+\S+|base\s+\S+|跟\s*\S+\s*比",
+            "", prompt, flags=re.IGNORECASE
+        ).strip()
         cmd = [CODEX_BIN, "review"]
         if review_args:
             cmd.extend(review_args.split())
         else:
             cmd.append("--uncommitted")
+        if review_instruction:
+            cmd.append(review_instruction)
         thinking = await (pikmin_send(message.channel, "🔍 Codex reviewing...", pikmin) if pikmin else message.reply("🔍 Codex reviewing..."))
         env = os.environ.copy()
         if OPENAI_API_KEY:
