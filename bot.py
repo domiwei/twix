@@ -1538,9 +1538,22 @@ async def _run_evaluator_codex(eval_prompt: str, cwd: str) -> str:
 
 
 CODING_MANAGER_SYSTEM_PROMPT = """\
-You are a coding task manager. Given a user's coding request and codebase context, produce a precise, self-contained specification for a code executor.
-Include: exact files to create/modify, what changes to make, and acceptance criteria.
-Be concise and actionable. Do NOT write code yourself — output only the specification."""
+You are a coding task manager. Analyze the user's coding request and output a routing decision as JSON.
+
+Classify as "simple" if the task is:
+- A small bug fix (1-2 files, obvious change)
+- Adding a small function/method
+- A config tweak or rename
+- Anything a skilled developer would finish in under 5 minutes
+
+Classify as "complex" if the task involves:
+- Implementing a new feature across multiple files
+- Architectural or design changes
+- Debugging an unknown issue requiring investigation
+- Extensive codebase exploration needed
+
+Output ONLY valid JSON (no markdown, no explanation):
+{"complexity": "simple"|"complex", "spec": "<concise, actionable task specification>"}"""
 
 
 async def _run_codex_coder(prompt: str, cwd: str, timeout: int | None = None) -> tuple[str, bool]:
@@ -4832,73 +4845,115 @@ async def on_message(message: discord.Message):
                 thinking = await message.reply("🤖 Manager 分析任務中...")
 
             try:
-                # Step 1: Claude Manager produces a concise spec for Codex
+                # Step 1: Claude Manager assesses complexity and produces spec
                 manager_result, _, _, _, _ = await run_claude(
                     enriched_prompt, cwd, None,
                     status_msg=thinking,
                     system_prompt=CODING_MANAGER_SYSTEM_PROMPT,
-                    max_turns=5,
+                    max_turns=3,
                 )
-                print(f"[CODING] manager spec len={len(manager_result)}", flush=True)
+                print(f"[CODING] manager output: {manager_result[:200]}", flush=True)
 
-                # Step 2: Codex executes the spec with full-auto
-                if pikmin:
-                    try:
-                        await pikmin_edit(thinking, "⚙️ Codex 執行中...", message.channel)
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        await thinking.edit(content="⚙️ Codex 執行中...")
-                    except Exception:
-                        pass
+                # Parse JSON decision; fall back to complex routing on failure
+                complexity = "complex"
+                spec = manager_result
+                try:
+                    raw = manager_result.strip()
+                    # Strip markdown code fences if present
+                    if raw.startswith("```"):
+                        raw = re.sub(r"^```[^\n]*\n?", "", raw)
+                        raw = re.sub(r"\n?```$", "", raw.strip())
+                    decision = json.loads(raw)
+                    complexity = decision.get("complexity", "complex")
+                    spec = decision.get("spec", manager_result)
+                except (json.JSONDecodeError, ValueError, AttributeError):
+                    print(f"[CODING] manager JSON parse failed, defaulting to complex", flush=True)
 
-                codex_result, codex_ok = await _run_codex_coder(manager_result, cwd)
-                print(f"[CODING] codex ok={codex_ok}, result_len={len(codex_result)}", flush=True)
+                print(f"[CODING] complexity={complexity}, spec_len={len(spec)}", flush=True)
 
-                if not codex_ok or not codex_result:
-                    err_text = "❌ Codex 執行失敗，請稍後再試。"
+                if complexity == "simple":
+                    # Simple task: Claude handles directly
+                    status_label = "⚡ Claude 執行中..."
                     if pikmin:
                         try:
-                            await pikmin_edit(thinking, err_text, message.channel)
-                        except Exception:
-                            await pikmin_send(message.channel, err_text, pikmin)
-                    else:
-                        try:
-                            await thinking.edit(content=err_text)
+                            await pikmin_edit(thinking, status_label, message.channel)
                         except Exception:
                             pass
-                    return
+                    else:
+                        try:
+                            await thinking.edit(content=status_label)
+                        except Exception:
+                            pass
+
+                    exec_result, exec_session_id, exec_tools, exec_turns, exec_usage = await run_claude(
+                        spec, cwd, None,
+                        status_msg=thinking,
+                        channel=message.channel,
+                    )
+                    if exec_session_id:
+                        channel_session[message.channel.id] = exec_session_id
+                        _save_state()
+                    gen_result = exec_result
+                else:
+                    # Complex task: Codex executes with full-auto
+                    if pikmin:
+                        try:
+                            await pikmin_edit(thinking, "⚙️ Codex 執行中...", message.channel)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await thinking.edit(content="⚙️ Codex 執行中...")
+                        except Exception:
+                            pass
+
+                    codex_result, codex_ok = await _run_codex_coder(spec, cwd)
+                    print(f"[CODING] codex ok={codex_ok}, result_len={len(codex_result)}", flush=True)
+
+                    if not codex_ok or not codex_result:
+                        err_text = "❌ Codex 執行失敗，請稍後再試。"
+                        if pikmin:
+                            try:
+                                await pikmin_edit(thinking, err_text, message.channel)
+                            except Exception:
+                                await pikmin_send(message.channel, err_text, pikmin)
+                        else:
+                            try:
+                                await thinking.edit(content=err_text)
+                            except Exception:
+                                pass
+                        return
+                    gen_result = codex_result
 
                 wt_info = channel_worktrees.get(message.channel.id)
-                display_result = codex_result
+                display_result = gen_result
                 if wt_info:
-                    display_result = f"📌 `{wt_info['branch']}`\n\n{codex_result}"
+                    display_result = f"📌 `{wt_info['branch']}`\n\n{gen_result}"
                 elif detected:
-                    display_result = f"📂 `{cwd}`\n\n{codex_result}"
+                    display_result = f"📂 `{cwd}`\n\n{gen_result}"
 
-                codex_chunks = split_message(display_result)
+                result_chunks = split_message(display_result)
                 if pikmin:
                     try:
-                        await pikmin_edit(thinking, codex_chunks[0], message.channel)
+                        await pikmin_edit(thinking, result_chunks[0], message.channel)
                     except Exception:
-                        await pikmin_send(message.channel, codex_chunks[0], pikmin)
-                    for chunk in codex_chunks[1:]:
+                        await pikmin_send(message.channel, result_chunks[0], pikmin)
+                    for chunk in result_chunks[1:]:
                         await pikmin_send(message.channel, chunk, pikmin)
                 else:
                     try:
-                        await thinking.edit(content=codex_chunks[0])
+                        await thinking.edit(content=result_chunks[0])
                     except Exception:
-                        await message.channel.send(codex_chunks[0])
-                    for chunk in codex_chunks[1:]:
+                        await message.channel.send(result_chunks[0])
+                    for chunk in result_chunks[1:]:
                         await message.channel.send(chunk)
 
-                # Step 3: Claude Evaluator reviews what Codex did
+                # Step 3: Claude Evaluator reviews
                 if pikmin:
                     eval_pikmin = _pick_eval_pikmin(pikmin)
                     eval_thinking = await pikmin_send(message.channel, "🔍 Claude Review 中...", eval_pikmin)
                     try:
-                        review = await run_evaluator(prompt, codex_result, cwd, channel=message.channel)
+                        review = await run_evaluator(prompt, gen_result, cwd, channel=message.channel)
                         verdict = _parse_verdict(review)
                         print(f"[CODING] evaluator verdict={verdict}", flush=True)
 
