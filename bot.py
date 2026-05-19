@@ -4057,24 +4057,29 @@ async def on_message(message: discord.Message):
 
         if args == "review" or args.startswith("review "):
             # !codex review [--base branch] [free-form instructions] — review git changes
+            # Codex CLI: scope flags (--uncommitted/--base) are mutually exclusive with [PROMPT].
+            # When user provides instructions, embed scope into prompt text instead.
             thinking = await (pikmin_send(message.channel, "🔍 Codex reviewing...", pikmin) if pikmin else message.reply("🔍 Codex reviewing..."))
             review_args = args[6:].strip()
             cmd = [CODEX_BIN, "review"]
-            review_prompt = ""
+            base_branch = None
+            instructions = ""
             if review_args:
-                # Extract --base <branch> if present, treat rest as a single PROMPT
                 base_m = re.search(r"--base\s+(\S+)", review_args)
                 if base_m:
-                    cmd.extend(["--base", base_m.group(1)])
+                    base_branch = base_m.group(1)
                     review_args = (review_args[:base_m.start()] + review_args[base_m.end():]).strip()
-                else:
-                    cmd.append("--uncommitted")
-                if review_args:
-                    review_prompt = review_args
+                instructions = review_args
+            if instructions:
+                scope_hint = (
+                    f"Review the changes against base branch '{base_branch}'."
+                    if base_branch else "Review the uncommitted changes."
+                )
+                cmd.append(f"{scope_hint} {instructions}")
+            elif base_branch:
+                cmd.extend(["--base", base_branch])
             else:
                 cmd.append("--uncommitted")
-            if review_prompt:
-                cmd.append(review_prompt)
             env = os.environ.copy()
             if OPENAI_API_KEY:
                 env["OPENAI_API_KEY"] = OPENAI_API_KEY
@@ -4814,23 +4819,27 @@ async def on_message(message: discord.Message):
         pikmin = _get_pikmin(message.channel.id)
         # Extract --base <branch> if mentioned in prompt
         base_match = re.search(r"--base\s+(\S+)|base\s+(\S+)|跟\s*(\S+)\s*比|compare.*?(\S+)", prompt)
-        review_args = ""
+        base_branch = None
         if base_match:
-            branch = next(g for g in base_match.groups() if g)
-            review_args = f"--base {branch}"
+            base_branch = next(g for g in base_match.groups() if g)
         # Strip common trigger phrases to get the meaningful instruction
         review_instruction = re.sub(
             r"(codex\s*)?(幫我\s*)?review\s*(一下|看看|這次改動|這個|這裡|吧|下)?|"
             r"看看有沒有問題|幫我看看|--base\s+\S+|base\s+\S+|跟\s*\S+\s*比",
             "", prompt, flags=re.IGNORECASE
         ).strip()
+        # Codex CLI: scope flags can't be combined with PROMPT — embed scope into prompt text.
         cmd = [CODEX_BIN, "review"]
-        if review_args:
-            cmd.extend(review_args.split())
+        if review_instruction:
+            scope_hint = (
+                f"Review the changes against base branch '{base_branch}'."
+                if base_branch else "Review the uncommitted changes."
+            )
+            cmd.append(f"{scope_hint} {review_instruction}")
+        elif base_branch:
+            cmd.extend(["--base", base_branch])
         else:
             cmd.append("--uncommitted")
-        if review_instruction:
-            cmd.append(review_instruction)
         thinking = await (pikmin_send(message.channel, "🔍 Codex reviewing...", pikmin) if pikmin else message.reply("🔍 Codex reviewing..."))
         env = os.environ.copy()
         if OPENAI_API_KEY:
