@@ -120,6 +120,18 @@ def _parse_verdict(review: str) -> str:
     return "PASS"
 
 
+def _verdict_is_explicit(review: str) -> bool:
+    """Whether the review text actually contains an explicit verdict marker.
+    Used to surface 'verdict unclear' warnings to the user."""
+    if not review:
+        return False
+    upper = review.upper()
+    return "**PASS**" in upper or "**FAIL**" in upper or "**PASS_WITH_SUGGESTIONS**" in upper or any(
+        line.strip().upper() in ("PASS", "FAIL", "PASS_WITH_SUGGESTIONS")
+        for line in review.strip().splitlines()[-5:]
+    )
+
+
 PLANNER_MODEL = os.environ.get("PLANNER_MODEL", "claude-opus-4-6")
 WRITE_TOOLS = {"Edit", "Write", "Bash", "NotebookEdit"}
 
@@ -5091,7 +5103,8 @@ async def on_message(message: discord.Message):
                     try:
                         review = await run_evaluator(prompt, gen_result, cwd, channel=message.channel)
                         verdict = _parse_verdict(review)
-                        print(f"[CODING] evaluator verdict={verdict}", flush=True)
+                        verdict_explicit = _verdict_is_explicit(review)
+                        print(f"[CODING] evaluator verdict={verdict} explicit={verdict_explicit}", flush=True)
 
                         if review:
                             review_chunks = split_message(review)
@@ -5103,6 +5116,12 @@ async def on_message(message: discord.Message):
                                 await pikmin_send(message.channel, chunk, eval_pikmin)
                         else:
                             await pikmin_edit(eval_thinking, "✅ Review 完成，沒有發現問題。", message.channel)
+
+                        if review and not verdict_explicit:
+                            await message.channel.send(
+                                "⚠️ **Verdict 不明確** — Evaluator 沒有輸出標準的 `**PASS**` / `**FAIL**` 格式，"
+                                "已預設為 PASS。請人工確認上方 review 內容是否真的通過。"
+                            )
 
                         if verdict == "FAIL":
                             # Escalate to Claude generator for fixes
