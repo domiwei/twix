@@ -4472,9 +4472,12 @@ async def on_message(message: discord.Message):
     thread_scoped = incident or message.channel.id in channel_worktrees
     if thread_scoped:
         # In incident/worktree threads, only allow thread-relevant intents
+        # Worktree threads also allow coding/codex_review (they exist for coding work)
         allowed_intents = {"monitor_dismiss", "task_done", "chat"}
         if incident:
             allowed_intents.add("monitor_teach")
+        if message.channel.id in channel_worktrees:
+            allowed_intents.update({"coding", "codex_review"})
         intent = await classify_intent(prompt, context)
         if intent not in allowed_intents:
             intent = "chat"
