@@ -1441,8 +1441,8 @@ async def _run_evaluator_claude(eval_prompt: str, cwd: str) -> str:
     return result or ""
 
 
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.4")
-CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-5.4-mini")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5")
+CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-5.5")
 CODEX_CODER_MODEL = os.environ.get("CODEX_CODER_MODEL", "gpt-5.5")
 
 
