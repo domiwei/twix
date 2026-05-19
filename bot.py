@@ -422,14 +422,14 @@ Available intents:
 - monitor_teach: User wants to teach a monitor something, add knowledge or rules (e.g. "告訴阿鏈...", "阿鏈記一下...", "這個錯誤不重要", "peer disconnected 不用管")
 - monitor_resume: User wants to restart/resume a stopped monitor (e.g. "重啟監控", "恢復監控", "把監控開回來", "resume monitor")
 - monitor_move: User wants to move a monitor's reporting to a different channel (e.g. "阿鏈去 #ops 回報", "把 erigon 監控搬到 #alerts", "monitor 改到 #ops")
-- branch_task: User wants to create a branch/worktree for parallel work (e.g. "開 branch fix/issue-42 在 erigon")
+- branch_task: User ONLY wants to create a branch/worktree (no implementation work yet) (e.g. "在 erigon 開 branch fix/issue-42", "新建 worktree 給我"). If the user also asks to implement/fix/write code on the branch, that's "coding" — NOT branch_task.
 - task_done: User says a task is complete (e.g. "做完了", "收工", "done")
 - task_list: User wants to list active tasks (e.g. "有哪些 task")
 - monitor_dismiss: User dismisses an alert as not a real problem in an incident thread (e.g. "這不是問題", "誤報", "false alarm", "沒事", "正常的")
 - fix: User confirms they want the bot to fix an issue (e.g. "修吧", "go ahead and fix it")
 - restart: User wants to restart a service (e.g. "跑看看", "restart it")
 - create_thread: User wants to open a discussion thread (e.g. "開個 thread 討論")
-- coding: User wants to implement, modify, create, or fix code in the codebase (e.g. "implement X", "fix bug in Y", "add feature Z", "幫我寫", "幫我實作", "幫我改", "修這個 bug"). Only classify as coding when the user wants actual code changes — not just explanations or questions about code.
+- coding: User wants to implement, modify, create, or fix code in the codebase (e.g. "implement X", "fix bug in Y", "add feature Z", "幫我寫", "幫我實作", "幫我改", "修這個 bug", "fork a branch and impl it", "讓 codex 實作", "assign to codex"). Includes cases where the user mentions creating a branch AND implementing on it. Only classify as coding when the user wants actual code changes — not just explanations or questions about code.
 - codex_review: User wants Codex to review code changes (e.g. "幫我 review 一下", "codex review", "review 這次改動", "看看有沒有問題", "review --base main"). Distinct from "coding" — this is reviewing existing changes, not making new ones.
 - chat: General conversation, questions, or anything that doesn't match the above
 
