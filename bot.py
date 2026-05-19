@@ -1553,8 +1553,18 @@ Classify as "complex" if the task involves:
 - Debugging an unknown issue requiring investigation
 - Extensive codebase exploration needed
 
-Output ONLY valid JSON (no markdown, no explanation):
-{"complexity": "simple"|"complex", "spec": "<concise, actionable task specification>"}"""
+For COMPLEX tasks, before outputting:
+1. Run `git branch --show-current` to check the current branch.
+2. Decide the target branch:
+   - If the user specified a branch, use it.
+   - If the user said "from latest main / new branch", propose a meaningful name like `feature/<short-desc>` or `fix/<short-desc>` based off the latest main.
+   - Otherwise reuse the current branch.
+3. Produce a detailed implementation plan covering: target branch, base branch (if new), files to create/modify, step-by-step changes, and acceptance criteria.
+
+For SIMPLE tasks, just include a brief task description in `spec`. Branch can be the current branch.
+
+Output ONLY valid JSON (no markdown fences, no preamble):
+{"complexity": "simple"|"complex", "branch": "<target branch name>", "base_branch": "<base branch if creating new, else empty string>", "spec": "<for simple: brief task; for complex: full markdown plan with sections for branch, files, steps, acceptance>"}"""
 
 
 async def _run_codex_coder(prompt: str, cwd: str, timeout: int | None = None) -> tuple[str, bool]:
@@ -4947,6 +4957,8 @@ async def on_message(message: discord.Message):
                 # Parse JSON decision; fall back to complex routing on failure
                 complexity = "complex"
                 spec = manager_result
+                plan_branch = ""
+                plan_base = ""
                 try:
                     raw = manager_result.strip()
                     # Strip markdown code fences if present
@@ -4956,10 +4968,12 @@ async def on_message(message: discord.Message):
                     decision = json.loads(raw)
                     complexity = decision.get("complexity", "complex")
                     spec = decision.get("spec", manager_result)
+                    plan_branch = decision.get("branch", "") or ""
+                    plan_base = decision.get("base_branch", "") or ""
                 except (json.JSONDecodeError, ValueError, AttributeError):
                     print(f"[CODING] manager JSON parse failed, defaulting to complex", flush=True)
 
-                print(f"[CODING] complexity={complexity}, spec_len={len(spec)}", flush=True)
+                print(f"[CODING] complexity={complexity}, branch={plan_branch!r}, base={plan_base!r}, spec_len={len(spec)}", flush=True)
 
                 if complexity == "simple":
                     # Simple task: Claude handles directly
@@ -4985,19 +4999,45 @@ async def on_message(message: discord.Message):
                         _save_state()
                     gen_result = exec_result
                 else:
-                    # Complex task: Codex executes with full-auto
+                    # Complex task: show plan first, then Codex executes
+                    plan_header = "📋 **Manager Plan**"
+                    branch_line = ""
+                    if plan_branch and plan_base:
+                        branch_line = f"🌿 Branch: `{plan_branch}`（從 `{plan_base}` 切出）\n"
+                    elif plan_branch:
+                        branch_line = f"🌿 Branch: `{plan_branch}`\n"
+                    plan_display = f"{plan_header}\n{branch_line}\n{spec}"
+                    plan_chunks = split_message(plan_display)
                     if pikmin:
                         try:
-                            await pikmin_edit(thinking, "⚙️ Codex 執行中...", message.channel)
+                            await pikmin_edit(thinking, plan_chunks[0], message.channel)
                         except Exception:
-                            pass
+                            await pikmin_send(message.channel, plan_chunks[0], pikmin)
+                        for chunk in plan_chunks[1:]:
+                            await pikmin_send(message.channel, chunk, pikmin)
                     else:
                         try:
-                            await thinking.edit(content="⚙️ Codex 執行中...")
+                            await thinking.edit(content=plan_chunks[0])
                         except Exception:
-                            pass
+                            await message.channel.send(plan_chunks[0])
+                        for chunk in plan_chunks[1:]:
+                            await message.channel.send(chunk)
 
-                    codex_result, codex_ok = await _run_codex_coder(spec, cwd)
+                    # New status message for Codex execution
+                    if pikmin:
+                        thinking = await pikmin_send(message.channel, "⚙️ Codex 執行中...", pikmin)
+                    else:
+                        thinking = await message.channel.send("⚙️ Codex 執行中...")
+
+                    # Embed plan branch into the spec so Codex knows where to work
+                    codex_spec = spec
+                    if plan_branch:
+                        branch_instr = (
+                            f"Work on branch `{plan_branch}` (create from `{plan_base}` if it doesn't exist). "
+                            if plan_base else f"Work on branch `{plan_branch}`. "
+                        )
+                        codex_spec = branch_instr + "\n\n" + spec
+                    codex_result, codex_ok = await _run_codex_coder(codex_spec, cwd)
                     print(f"[CODING] codex ok={codex_ok}, result_len={len(codex_result)}", flush=True)
 
                     if not codex_ok or not codex_result:
