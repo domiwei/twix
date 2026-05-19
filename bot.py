@@ -1563,7 +1563,12 @@ For COMPLEX tasks, before outputting:
 
 For SIMPLE tasks, just include a brief task description in `spec`. Branch can be the current branch.
 
-Output ONLY valid JSON (no markdown fences, no preamble):
+CRITICAL OUTPUT RULES:
+- Your FINAL message must be ONLY the JSON object — no preamble, no questions, no markdown fences, no trailing text.
+- Do NOT ask for user confirmation. Just output the JSON.
+- Even if you ran out of investigation time, output your best-guess JSON based on what you know.
+
+Schema:
 {"complexity": "simple"|"complex", "branch": "<target branch name>", "base_branch": "<base branch if creating new, else empty string>", "spec": "<for simple: brief task; for complex: full markdown plan with sections for branch, files, steps, acceptance>"}"""
 
 
@@ -4950,7 +4955,7 @@ async def on_message(message: discord.Message):
                     enriched_prompt, cwd, None,
                     status_msg=thinking,
                     system_prompt=CODING_MANAGER_SYSTEM_PROMPT,
-                    max_turns=3,
+                    max_turns=15,
                 )
                 print(f"[CODING] manager output: {manager_result[:200]}", flush=True)
 
