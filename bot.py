@@ -1562,7 +1562,7 @@ async def _run_codex_coder(prompt: str, cwd: str, timeout: int | None = None) ->
     cmd = [
         CODEX_BIN, "exec",
         "--json",
-        "-s", "full-auto",
+        "-s", "workspace-write",
         "-C", cwd,
         "-m", CODEX_CODER_MODEL,
         prompt,
@@ -1590,6 +1590,9 @@ async def _run_codex_coder(prompt: str, cwd: str, timeout: int | None = None) ->
             return "", False
         if "401 Unauthorized" in stderr_text or "500 Internal Server Error" in stderr_text:
             print(f"[CODEX_CODER] API error", flush=True)
+            return "", False
+        if proc.returncode != 0:
+            print(f"[CODEX_CODER] exit {proc.returncode}: {stderr_text[:300]}", flush=True)
             return "", False
 
         result_parts = []
