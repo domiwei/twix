@@ -694,6 +694,7 @@ def _format_tool_desc(name: str, input_data: dict) -> str:
 
 CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "7200"))  # 2h default — generator turns
 EVALUATOR_TIMEOUT = int(os.environ.get("EVALUATOR_TIMEOUT", "1800"))  # 30m default — evaluator / review passes
+PROGRESS_INTERVAL = int(os.environ.get("PROGRESS_INTERVAL", "300"))  # seconds between progress pings (0 = off)
 
 
 async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout: int | None = None, env_override: dict | None = None) -> tuple[str, str | None, list[str], int, dict, bool]:
@@ -801,13 +802,37 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout:
                 print(f"[CLAUDE] done: {num_turns} turns, ${cost:.4f}, result_len={len(result_text)}, input_tokens={usage_data.get('input_tokens', '?')}", flush=True)
                 return  # Don't wait for EOF — child processes may keep stdout open
 
+    start_time = time.monotonic()
+
+    async def _progress_reporter():
+        await asyncio.sleep(PROGRESS_INTERVAL)
+        while True:
+            elapsed = int(time.monotonic() - start_time)
+            minutes, secs = divmod(elapsed, 60)
+            channel = getattr(status_msg, 'channel', None)
+            if channel:
+                recent = tools_used[-5:] if tools_used else []
+                tools_str = "\n".join(f"　{t}" for t in recent) if recent else "　（尚無工具呼叫）"
+                try:
+                    await channel.send(
+                        f"⏱️ **進度更新** — 已執行 {minutes} 分鐘 {secs} 秒\n"
+                        f"已完成 {len(tools_used)} 個步驟，目前：{current_status}\n"
+                        f"最近操作：\n{tools_str}"
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(PROGRESS_INTERVAL)
+
     async def _do_stream():
         events_task = asyncio.create_task(read_events())
         stderr_task = asyncio.create_task(read_stderr())
+        progress_task = asyncio.create_task(_progress_reporter()) if status_msg and PROGRESS_INTERVAL > 0 else None
         # Wait for events (returns when result event received or EOF)
         await events_task
         # Don't wait for stderr — child processes (e.g. http.server) may keep pipes open
         stderr_task.cancel()
+        if progress_task:
+            progress_task.cancel()
         # Ensure the Claude process is fully stopped before we return.
         # Without this, background tasks (e.g. bash monitor scripts) keep
         # the process alive, and the next --resume spawns a competing
@@ -3337,6 +3362,9 @@ async def monitor_loop(monitor_id: str, channel):
     while True:
         await asyncio.sleep(initial_sleep)
         initial_sleep = check_interval  # subsequent iterations use full interval
+        if not config.get("enabled", True):
+            print(f"[MONITOR] {config['name']} disabled, exiting loop", flush=True)
+            break
         try:
             # ── Step 1: Collect (fresh Claude session, structured output) ──
             if use_claude_collect:
@@ -3696,6 +3724,34 @@ HELP_TEXT = """**Twix Bot 指令說明**
 """
 
 
+_STALE_PATTERNS = ("⏳ 處理中...", "⏳ 分析中...", "⏳ 正在建立", "⏳ 正在整理", "🔍 分析監控", "🔍 Codex", "🤖 Codex", "📋 Planner", "🔧 調整中", "🧠 Manager")
+
+async def _cleanup_stale_status_messages():
+    """Update any ⏳ 處理中... messages left hanging from the previous bot session."""
+    await asyncio.sleep(2)  # let Discord connection settle
+    checked = set()
+    all_channel_ids = list(channel_session.keys()) + [m.get("channel_id") for m in monitor_configs.values() if m.get("channel_id")]
+    for channel_id in all_channel_ids:
+        if channel_id in checked:
+            continue
+        checked.add(channel_id)
+        try:
+            ch = client.get_channel(channel_id)
+            if not ch:
+                continue
+            async for msg in ch.history(limit=15):
+                if msg.author != client.user:
+                    continue
+                if any(msg.content.startswith(p) for p in _STALE_PATTERNS):
+                    try:
+                        await msg.edit(content="⚠️ Bot 重啟，上一個操作被中斷。請重新發送指令。")
+                    except Exception:
+                        pass
+                    break  # only fix the most recent stale message per channel
+        except Exception as e:
+            print(f"[STARTUP] cleanup channel {channel_id}: {e}", flush=True)
+
+
 # ── Events ───────────────────────────────────────────────────────────────────
 
 @client.event
@@ -3723,6 +3779,9 @@ async def on_ready():
     for inc in active_incidents.values():
         if inc.get("status") != "resolved":
             bot_threads.add(inc["thread_id"])
+
+    # Clean up stale "⏳ 處理中..." messages left by the previous session
+    asyncio.create_task(_cleanup_stale_status_messages())
 
 
 @client.event
@@ -5020,6 +5079,12 @@ async def on_message(message: discord.Message):
             asyncio.create_task(
                 update_thread_summary(message.channel.id, prompt, result, thread_topic)
             )
+        except asyncio.CancelledError:
+            try:
+                await thinking.edit(content="⚠️ 被中斷，請重新發送指令。")
+            except Exception:
+                pass
+            raise
         except Exception as e:
             print(f"[REPLY] ERROR: {e}", flush=True)
             err_msg = f"❌ Error: {e}"
