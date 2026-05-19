@@ -4925,12 +4925,14 @@ async def on_message(message: discord.Message):
                         return
                     gen_result = codex_result
 
+                executor_tag = "⚡ `Claude`" if complexity == "simple" else f"⚙️ `Codex {CODEX_CODER_MODEL}`"
                 wt_info = channel_worktrees.get(message.channel.id)
-                display_result = gen_result
+                prefix = executor_tag
                 if wt_info:
-                    display_result = f"📌 `{wt_info['branch']}`\n\n{gen_result}"
+                    prefix += f" · 📌 `{wt_info['branch']}`"
                 elif detected:
-                    display_result = f"📂 `{cwd}`\n\n{gen_result}"
+                    prefix += f" · 📂 `{cwd}`"
+                display_result = f"{prefix}\n\n{gen_result}"
 
                 result_chunks = split_message(display_result)
                 if pikmin:
