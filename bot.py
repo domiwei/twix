@@ -429,6 +429,7 @@ Available intents:
 - fix: User confirms they want the bot to fix an issue (e.g. "修吧", "go ahead and fix it")
 - restart: User wants to restart a service (e.g. "跑看看", "restart it")
 - create_thread: User wants to open a discussion thread (e.g. "開個 thread 討論")
+- coding: User wants to implement, modify, create, or fix code in the codebase (e.g. "implement X", "fix bug in Y", "add feature Z", "幫我寫", "幫我實作", "幫我改", "修這個 bug"). Only classify as coding when the user wants actual code changes — not just explanations or questions about code.
 - chat: General conversation, questions, or anything that doesn't match the above
 
 Important:
@@ -971,7 +972,8 @@ async def _kill_stale_session_procs(session_id: str) -> None:
 
 
 async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
-                     status_msg=None, channel=None, system_prompt: str | None = None) -> tuple[str, str | None, list[str], int, dict]:
+                     status_msg=None, channel=None, system_prompt: str | None = None,
+                     max_turns: int | None = None) -> tuple[str, str | None, list[str], int, dict]:
     sys_prompt = system_prompt or SYSTEM_PROMPT
 
     cmd = [
@@ -981,7 +983,7 @@ async def run_claude(prompt: str, cwd: str, session_id: str | None = None,
         "--system-prompt", sys_prompt,
         "--output-format", "stream-json",
         "--verbose",
-        "--max-turns", str(MAX_TURNS),
+        "--max-turns", str(max_turns if max_turns is not None else MAX_TURNS),
     ]
     if session_id:
         cmd.extend(["--resume", session_id])
@@ -1441,6 +1443,7 @@ async def _run_evaluator_claude(eval_prompt: str, cwd: str) -> str:
 
 CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.4")
 CODEX_FALLBACK_MODEL = os.environ.get("CODEX_FALLBACK_MODEL", "gpt-5.4-mini")
+CODEX_CODER_MODEL = os.environ.get("CODEX_CODER_MODEL", "gpt-5.5")
 
 
 async def _run_codex_exec(prompt: str, cwd: str, model: str | None = None,
@@ -1532,6 +1535,72 @@ async def _run_evaluator_codex(eval_prompt: str, cwd: str) -> str:
 
     print(f"[EVALUATOR] codex failed, no result", flush=True)
     return ""
+
+
+CODING_MANAGER_SYSTEM_PROMPT = """\
+You are a coding task manager. Given a user's coding request and codebase context, produce a precise, self-contained specification for a code executor.
+Include: exact files to create/modify, what changes to make, and acceptance criteria.
+Be concise and actionable. Do NOT write code yourself — output only the specification."""
+
+
+async def _run_codex_coder(prompt: str, cwd: str, timeout: int | None = None) -> tuple[str, bool]:
+    """Run codex exec with full-auto safety for coding tasks. Returns (result, success)."""
+    cmd = [
+        CODEX_BIN, "exec",
+        "--json",
+        "-s", "full-auto",
+        "-C", cwd,
+        "-m", CODEX_CODER_MODEL,
+        prompt,
+    ]
+
+    env = os.environ.copy()
+    if OPENAI_API_KEY:
+        env["OPENAI_API_KEY"] = OPENAI_API_KEY
+
+    effective_timeout = timeout or CLAUDE_TIMEOUT
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            limit=1024 * 1024,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=effective_timeout)
+        output = stdout.decode("utf-8", errors="replace").strip()
+        stderr_text = stderr.decode("utf-8", errors="replace").strip()
+
+        if "at capacity" in stderr_text or "at capacity" in output:
+            print(f"[CODEX_CODER] model at capacity", flush=True)
+            return "", False
+        if "401 Unauthorized" in stderr_text or "500 Internal Server Error" in stderr_text:
+            print(f"[CODEX_CODER] API error", flush=True)
+            return "", False
+
+        result_parts = []
+        for line in output.splitlines():
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") == "item.completed":
+                item = event.get("item", {})
+                if item.get("type") == "agent_message" and item.get("text"):
+                    result_parts.append(item["text"])
+
+        result = "\n\n".join(result_parts).strip() or output
+        if stderr_text:
+            print(f"[CODEX_CODER] stderr: {stderr_text[:200]}", flush=True)
+        return result, True
+    except asyncio.TimeoutError:
+        print(f"[CODEX_CODER] timeout after {effective_timeout}s", flush=True)
+        return "", False
+    except Exception as e:
+        print(f"[CODEX_CODER] error: {e}", flush=True)
+        return "", False
 
 
 async def run_evaluator(user_prompt: str, generator_result: str, cwd: str,
@@ -4710,6 +4779,206 @@ async def on_message(message: discord.Message):
             await pikmin_send(thread, f"🧵 Thread 已建立！我是 **{pikmin['name']}**，由我來負責。\n工作目錄：`{channel_workdir[thread.id]}`", pikmin)
         except Exception as e:
             await message.reply(f"❌ 無法建立 thread: {e}")
+        return
+
+    if intent == "coding":
+        detected = detect_project(prompt)
+        if detected:
+            new_cwd = os.path.join(WORK_ROOT, detected)
+            old_cwd = channel_workdir.get(message.channel.id)
+            if old_cwd != new_cwd:
+                channel_workdir[message.channel.id] = new_cwd
+                if old_cwd is not None:
+                    channel_session[message.channel.id] = None
+                _save_state()
+
+        lock = _get_channel_lock(message.channel.id)
+        if lock.locked():
+            await message.reply("⏳ 上一個請求還在處理中，請稍後再試。")
+            return
+
+        async with lock:
+            cwd = channel_workdir.get(message.channel.id, WORK_ROOT)
+            session_id = channel_session.get(message.channel.id)
+            pikmin = _get_pikmin(message.channel.id)
+
+            # Build enriched prompt with thread/relay context
+            enriched_prompt = prompt
+            if message.reference and message.reference.message_id:
+                try:
+                    ref_msg = message.reference.resolved or await message.channel.fetch_message(message.reference.message_id)
+                    if ref_msg and ref_msg.content:
+                        enriched_prompt = f"[用戶引用的訊息]\n{ref_msg.content[:3000]}\n\n[用戶的回覆]\n{prompt}"
+                except Exception:
+                    pass
+            if not session_id:
+                ctx_parts = []
+                if isinstance(message.channel, discord.Thread):
+                    try:
+                        thread_hist = await fetch_thread_history(message.channel, limit=20, max_chars=8000)
+                        if thread_hist:
+                            ctx_parts.append(f"## 這個 thread 之前的對話\n{thread_hist}")
+                    except Exception:
+                        pass
+                relay_ctx = build_relay_context(message.channel.id)
+                if relay_ctx:
+                    ctx_parts.append(relay_ctx)
+                if ctx_parts:
+                    enriched_prompt = "\n\n---\n".join(ctx_parts) + f"\n\n---\n{prompt}"
+
+            if pikmin:
+                thinking = await pikmin_send(message.channel, "🤖 Manager 分析任務中...", pikmin)
+            else:
+                thinking = await message.reply("🤖 Manager 分析任務中...")
+
+            try:
+                # Step 1: Claude Manager produces a concise spec for Codex
+                manager_result, _, _, _, _ = await run_claude(
+                    enriched_prompt, cwd, None,
+                    status_msg=thinking,
+                    system_prompt=CODING_MANAGER_SYSTEM_PROMPT,
+                    max_turns=5,
+                )
+                print(f"[CODING] manager spec len={len(manager_result)}", flush=True)
+
+                # Step 2: Codex executes the spec with full-auto
+                if pikmin:
+                    try:
+                        await pikmin_edit(thinking, "⚙️ Codex 執行中...", message.channel)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await thinking.edit(content="⚙️ Codex 執行中...")
+                    except Exception:
+                        pass
+
+                codex_result, codex_ok = await _run_codex_coder(manager_result, cwd)
+                print(f"[CODING] codex ok={codex_ok}, result_len={len(codex_result)}", flush=True)
+
+                if not codex_ok or not codex_result:
+                    err_text = "❌ Codex 執行失敗，請稍後再試。"
+                    if pikmin:
+                        try:
+                            await pikmin_edit(thinking, err_text, message.channel)
+                        except Exception:
+                            await pikmin_send(message.channel, err_text, pikmin)
+                    else:
+                        try:
+                            await thinking.edit(content=err_text)
+                        except Exception:
+                            pass
+                    return
+
+                wt_info = channel_worktrees.get(message.channel.id)
+                display_result = codex_result
+                if wt_info:
+                    display_result = f"📌 `{wt_info['branch']}`\n\n{codex_result}"
+                elif detected:
+                    display_result = f"📂 `{cwd}`\n\n{codex_result}"
+
+                codex_chunks = split_message(display_result)
+                if pikmin:
+                    try:
+                        await pikmin_edit(thinking, codex_chunks[0], message.channel)
+                    except Exception:
+                        await pikmin_send(message.channel, codex_chunks[0], pikmin)
+                    for chunk in codex_chunks[1:]:
+                        await pikmin_send(message.channel, chunk, pikmin)
+                else:
+                    try:
+                        await thinking.edit(content=codex_chunks[0])
+                    except Exception:
+                        await message.channel.send(codex_chunks[0])
+                    for chunk in codex_chunks[1:]:
+                        await message.channel.send(chunk)
+
+                # Step 3: Claude Evaluator reviews what Codex did
+                if pikmin:
+                    eval_pikmin = _pick_eval_pikmin(pikmin)
+                    eval_thinking = await pikmin_send(message.channel, "🔍 Claude Review 中...", eval_pikmin)
+                    try:
+                        review = await run_evaluator(prompt, codex_result, cwd, channel=message.channel)
+                        verdict = _parse_verdict(review)
+                        print(f"[CODING] evaluator verdict={verdict}", flush=True)
+
+                        if review:
+                            review_chunks = split_message(review)
+                            try:
+                                await pikmin_edit(eval_thinking, review_chunks[0], message.channel)
+                            except Exception:
+                                await pikmin_send(message.channel, review_chunks[0], eval_pikmin)
+                            for chunk in review_chunks[1:]:
+                                await pikmin_send(message.channel, chunk, eval_pikmin)
+                        else:
+                            await pikmin_edit(eval_thinking, "✅ Review 完成，沒有發現問題。", message.channel)
+
+                        if verdict == "FAIL":
+                            # Escalate to Claude generator for fixes
+                            fix_session = None
+                            for fix_round in range(2, MAX_GEN_EVAL_ROUNDS + 1):
+                                fix_prompt = (
+                                    f"Codex 執行了以下編碼任務但 Review 不通過。\n"
+                                    f"原始需求：{prompt}\n\n"
+                                    f"Evaluator 的回饋：\n{review}\n\n"
+                                    f"請修正並說明改了什麼。"
+                                )
+                                fix_thinking = await pikmin_send(
+                                    message.channel, f"🔧 Claude 修正中... (第 {fix_round}/{MAX_GEN_EVAL_ROUNDS} 輪)", pikmin
+                                )
+                                fix_result, fix_sid, _, _, _ = await run_claude(
+                                    fix_prompt, cwd, fix_session, status_msg=fix_thinking, channel=message.channel,
+                                )
+                                if fix_sid:
+                                    fix_session = fix_sid
+
+                                fix_chunks = split_message(fix_result)
+                                try:
+                                    await pikmin_edit(fix_thinking, fix_chunks[0], message.channel)
+                                except Exception:
+                                    await pikmin_send(message.channel, fix_chunks[0], pikmin)
+                                for chunk in fix_chunks[1:]:
+                                    await pikmin_send(message.channel, chunk, pikmin)
+
+                                re_thinking = await pikmin_send(
+                                    message.channel, f"🔍 Re-review 中... (第 {fix_round}/{MAX_GEN_EVAL_ROUNDS} 輪)", eval_pikmin
+                                )
+                                review = await run_evaluator(prompt, fix_result, cwd, channel=message.channel)
+                                if review:
+                                    re_chunks = split_message(review)
+                                    try:
+                                        await pikmin_edit(re_thinking, re_chunks[0], message.channel)
+                                    except Exception:
+                                        await pikmin_send(message.channel, re_chunks[0], eval_pikmin)
+                                    for chunk in re_chunks[1:]:
+                                        await pikmin_send(message.channel, chunk, eval_pikmin)
+                                else:
+                                    await pikmin_edit(re_thinking, "✅ 修正後沒有發現問題。", message.channel)
+
+                                verdict = _parse_verdict(review)
+                                if verdict in ("PASS", "PASS_WITH_SUGGESTIONS"):
+                                    break
+                            else:
+                                await message.channel.send(f"⚠️ 經 {MAX_GEN_EVAL_ROUNDS} 輪修正仍有問題，請人工檢查。")
+                    except Exception as eval_err:
+                        print(f"[CODING] eval error: {eval_err}", flush=True)
+                        try:
+                            await pikmin_edit(eval_thinking, f"⚠️ Review 失敗: {eval_err}", message.channel)
+                        except Exception:
+                            pass
+
+            except asyncio.CancelledError:
+                try:
+                    await thinking.edit(content="⚠️ 被中斷，請重新發送指令。")
+                except Exception:
+                    pass
+                raise
+            except Exception as e:
+                print(f"[CODING] ERROR: {e}", flush=True)
+                try:
+                    await thinking.edit(content=f"❌ Error: {e}")
+                except Exception:
+                    pass
         return
 
     # ── intent == "chat" or fallback: send to Claude ──
