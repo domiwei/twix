@@ -430,6 +430,7 @@ Available intents:
 - restart: User wants to restart a service (e.g. "跑看看", "restart it")
 - create_thread: User wants to open a discussion thread (e.g. "開個 thread 討論")
 - coding: User wants to implement, modify, create, or fix code in the codebase (e.g. "implement X", "fix bug in Y", "add feature Z", "幫我寫", "幫我實作", "幫我改", "修這個 bug"). Only classify as coding when the user wants actual code changes — not just explanations or questions about code.
+- codex_review: User wants Codex to review code changes (e.g. "幫我 review 一下", "codex review", "review 這次改動", "看看有沒有問題", "review --base main"). Distinct from "coding" — this is reviewing existing changes, not making new ones.
 - chat: General conversation, questions, or anything that doesn't match the above
 
 Important:
@@ -4792,6 +4793,60 @@ async def on_message(message: discord.Message):
             await pikmin_send(thread, f"🧵 Thread 已建立！我是 **{pikmin['name']}**，由我來負責。\n工作目錄：`{channel_workdir[thread.id]}`", pikmin)
         except Exception as e:
             await message.reply(f"❌ 無法建立 thread: {e}")
+        return
+
+    if intent == "codex_review":
+        cwd = channel_workdir.get(message.channel.id, WORK_ROOT)
+        pikmin = _get_pikmin(message.channel.id)
+        # Extract --base <branch> if mentioned in prompt
+        base_match = re.search(r"--base\s+(\S+)|base\s+(\S+)|跟\s*(\S+)\s*比|compare.*?(\S+)", prompt)
+        review_args = ""
+        if base_match:
+            branch = next(g for g in base_match.groups() if g)
+            review_args = f"--base {branch}"
+        cmd = [CODEX_BIN, "review"]
+        if review_args:
+            cmd.extend(review_args.split())
+        else:
+            cmd.append("--uncommitted")
+        thinking = await (pikmin_send(message.channel, "🔍 Codex reviewing...", pikmin) if pikmin else message.reply("🔍 Codex reviewing..."))
+        env = os.environ.copy()
+        if OPENAI_API_KEY:
+            env["OPENAI_API_KEY"] = OPENAI_API_KEY
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=EVALUATOR_TIMEOUT)
+            result = stdout.decode("utf-8", errors="replace").strip()
+            if not result:
+                result = stderr.decode("utf-8", errors="replace").strip()
+            if not result:
+                result = "（Codex review 沒有輸出）"
+            lines = result.splitlines()
+            for i, line in enumerate(lines):
+                if line.startswith("codex") or line.startswith("##") or line.startswith("**"):
+                    result = "\n".join(lines[i:])
+                    break
+        except asyncio.TimeoutError:
+            result = f"⏰ Codex review 超時（{EVALUATOR_TIMEOUT // 60} 分鐘）"
+        except Exception as e:
+            result = f"❌ Codex review 失敗: {e}"
+        chunks = split_message(result)
+        if pikmin:
+            try:
+                await pikmin_edit(thinking, chunks[0], message.channel)
+            except Exception:
+                await pikmin_send(message.channel, chunks[0], pikmin)
+            for chunk in chunks[1:]:
+                await pikmin_send(message.channel, chunk, pikmin)
+        else:
+            await thinking.edit(content=chunks[0])
+            for chunk in chunks[1:]:
+                await message.channel.send(chunk)
         return
 
     if intent == "coding":
