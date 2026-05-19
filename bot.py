@@ -4056,14 +4056,25 @@ async def on_message(message: discord.Message):
         pikmin = _get_pikmin(message.channel.id)
 
         if args == "review" or args.startswith("review "):
-            # !codex review [--base branch] — review git changes
+            # !codex review [--base branch] [free-form instructions] — review git changes
             thinking = await (pikmin_send(message.channel, "🔍 Codex reviewing...", pikmin) if pikmin else message.reply("🔍 Codex reviewing..."))
             review_args = args[6:].strip()
             cmd = [CODEX_BIN, "review"]
+            review_prompt = ""
             if review_args:
-                cmd.extend(review_args.split())
+                # Extract --base <branch> if present, treat rest as a single PROMPT
+                base_m = re.search(r"--base\s+(\S+)", review_args)
+                if base_m:
+                    cmd.extend(["--base", base_m.group(1)])
+                    review_args = (review_args[:base_m.start()] + review_args[base_m.end():]).strip()
+                else:
+                    cmd.append("--uncommitted")
+                if review_args:
+                    review_prompt = review_args
             else:
                 cmd.append("--uncommitted")
+            if review_prompt:
+                cmd.append(review_prompt)
             env = os.environ.copy()
             if OPENAI_API_KEY:
                 env["OPENAI_API_KEY"] = OPENAI_API_KEY
