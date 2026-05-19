@@ -442,7 +442,7 @@ Available intents:
 - restart: User wants to restart a service (e.g. "跑看看", "restart it")
 - create_thread: User wants to open a discussion thread (e.g. "開個 thread 討論")
 - coding: User wants to implement, modify, create, or fix code in the codebase (e.g. "implement X", "fix bug in Y", "add feature Z", "幫我寫", "幫我實作", "幫我改", "修這個 bug", "fork a branch and impl it", "讓 codex 實作", "assign to codex"). Includes cases where the user mentions creating a branch AND implementing on it. Only classify as coding when the user wants actual code changes — not just explanations or questions about code.
-- codex_review: User wants Codex to review code changes (e.g. "幫我 review 一下", "codex review", "review 這次改動", "看看有沒有問題", "review --base main"). Distinct from "coding" — this is reviewing existing changes, not making new ones.
+- codex_review: User wants Codex to PROACTIVELY review LOCAL git changes that the bot just made or that are currently uncommitted (e.g. "幫我 review 一下", "codex review", "review 這次改動", "review --base main"). Does NOT apply when the user is asking about reviewer feedback on a GitHub PR ("PR 有 review feedback", "reviewer 說 X", "看一下 PR review") — those are "chat" so Claude can use `gh pr view --comments`.
 - chat: General conversation, questions, or anything that doesn't match the above
 
 Important:
@@ -4504,9 +4504,9 @@ async def on_message(message: discord.Message):
     # Add recent conversation context so classifier knows what's being discussed
     try:
         recent_msgs = []
-        async for msg in message.channel.history(limit=4, before=message):
+        async for msg in message.channel.history(limit=15, before=message):
             role = "bot" if msg.author == client.user or msg.webhook_id else "user"
-            recent_msgs.append(f"{role}: {msg.content[:80]}")
+            recent_msgs.append(f"{role}: {msg.content[:200]}")
         if recent_msgs:
             recent_msgs.reverse()
             ctx_parts.append(f"Recent conversation: {' | '.join(recent_msgs)}")
