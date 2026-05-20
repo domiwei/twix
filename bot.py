@@ -5380,12 +5380,12 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
             # Inject relay summaries from previous sessions (context relay)
+            # Note: cross_thread_context (other channels' summaries) intentionally
+            # disabled — it caused ambiguous commands to act on the wrong topic.
+            # Function kept defined for future re-enable.
             relay_ctx = build_relay_context(message.channel.id)
-            cross_ctx = build_cross_thread_context(message.channel.id)
             if relay_ctx:
                 context_parts.append(relay_ctx)
-            if cross_ctx:
-                context_parts.append(f"[其他頻道背景，僅供參考]\n{cross_ctx}")
             if context_parts:
                 enriched_prompt = "\n\n---\n".join(context_parts) + f"\n\n---\n{prompt}"
 
