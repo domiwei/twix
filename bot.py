@@ -2102,6 +2102,189 @@ def _pick_eval_pikmin(gen_pikmin: dict) -> dict:
     return PIKMIN_POOL[eval_idx]
 
 
+async def _run_coding_execution(
+    executor: str,
+    channel,
+    cwd: str,
+    spec: str,
+    plan_branch: str,
+    plan_base: str,
+    prompt: str,
+    pikmin: dict,
+    detected: str = "",
+):
+    """Run the chosen executor on the spec, then evaluator + fix loop.
+
+    Acquires the channel lock for the duration so concurrent requests on the
+    same channel are serialized just like the original handler did.
+    """
+    lock = _get_channel_lock(channel.id)
+    async with lock:
+        try:
+            if executor == "claude":
+                status_label = "⚡ Claude 執行中..."
+            else:
+                status_label = "⚙️ Codex 執行中..."
+
+            if pikmin:
+                thinking = await pikmin_send(channel, status_label, pikmin)
+            else:
+                thinking = await channel.send(status_label)
+
+            if executor == "claude":
+                gen_result, gen_session_id, _, _, _ = await run_claude(
+                    spec, cwd, None,
+                    status_msg=thinking,
+                    channel=channel,
+                )
+                if gen_session_id:
+                    channel_session[channel.id] = gen_session_id
+                    _save_state()
+            else:
+                codex_spec = spec
+                if plan_branch:
+                    branch_instr = (
+                        f"Work on branch `{plan_branch}` (create from `{plan_base}` if it doesn't exist). "
+                        if plan_base else f"Work on branch `{plan_branch}`. "
+                    )
+                    codex_spec = branch_instr + "\n\n" + spec
+                codex_result, codex_ok = await _run_codex_coder(codex_spec, cwd)
+                print(f"[CODING] codex ok={codex_ok}, result_len={len(codex_result)}", flush=True)
+
+                if not codex_ok or not codex_result:
+                    err_text = "❌ Codex 執行失敗，請稍後再試。"
+                    if pikmin:
+                        try:
+                            await pikmin_edit(thinking, err_text, channel)
+                        except Exception:
+                            await pikmin_send(channel, err_text, pikmin)
+                    else:
+                        try:
+                            await thinking.edit(content=err_text)
+                        except Exception:
+                            pass
+                    return
+                gen_result = codex_result
+
+            executor_tag = "⚡ `Claude`" if executor == "claude" else f"⚙️ `Codex {CODEX_CODER_MODEL}`"
+            wt_info = channel_worktrees.get(channel.id)
+            prefix = executor_tag
+            if wt_info:
+                prefix += f" · 📌 `{wt_info['branch']}`"
+            elif detected:
+                prefix += f" · 📂 `{cwd}`"
+            display_result = f"{prefix}\n\n{gen_result}"
+
+            result_chunks = split_message(display_result)
+            if pikmin:
+                try:
+                    await pikmin_edit(thinking, result_chunks[0], channel)
+                except Exception:
+                    await pikmin_send(channel, result_chunks[0], pikmin)
+                for chunk in result_chunks[1:]:
+                    await pikmin_send(channel, chunk, pikmin)
+            else:
+                try:
+                    await thinking.edit(content=result_chunks[0])
+                except Exception:
+                    await channel.send(result_chunks[0])
+                for chunk in result_chunks[1:]:
+                    await channel.send(chunk)
+
+            # Step 3: Claude Evaluator reviews
+            if pikmin:
+                eval_pikmin = _pick_eval_pikmin(pikmin)
+                eval_thinking = await pikmin_send(channel, "🔍 Claude Review 中...", eval_pikmin)
+                try:
+                    review = await run_evaluator(prompt, gen_result, cwd, channel=channel)
+                    verdict = _parse_verdict(review)
+                    verdict_explicit = _verdict_is_explicit(review)
+                    print(f"[CODING] evaluator verdict={verdict} explicit={verdict_explicit}", flush=True)
+
+                    if review:
+                        review_chunks = split_message(review)
+                        try:
+                            await pikmin_edit(eval_thinking, review_chunks[0], channel)
+                        except Exception:
+                            await pikmin_send(channel, review_chunks[0], eval_pikmin)
+                        for chunk in review_chunks[1:]:
+                            await pikmin_send(channel, chunk, eval_pikmin)
+                    else:
+                        await pikmin_edit(eval_thinking, "✅ Review 完成，沒有發現問題。", channel)
+
+                    if review and not verdict_explicit:
+                        await channel.send(
+                            "⚠️ **Verdict 不明確** — Evaluator 沒有輸出標準的 `**PASS**` / `**FAIL**` 格式，"
+                            "已預設為 PASS。請人工確認上方 review 內容是否真的通過。"
+                        )
+
+                    if verdict == "FAIL":
+                        # Escalate to Claude generator for fixes
+                        fix_session = None
+                        for fix_round in range(2, MAX_GEN_EVAL_ROUNDS + 1):
+                            fix_prompt = (
+                                f"上一個執行者跑了以下編碼任務但 Review 不通過。\n"
+                                f"原始需求：{prompt}\n\n"
+                                f"Evaluator 的回饋：\n{review}\n\n"
+                                f"請修正並說明改了什麼。"
+                            )
+                            fix_thinking = await pikmin_send(
+                                channel, f"🔧 Claude 修正中... (第 {fix_round}/{MAX_GEN_EVAL_ROUNDS} 輪)", pikmin
+                            )
+                            fix_result, fix_sid, _, _, _ = await run_claude(
+                                fix_prompt, cwd, fix_session, status_msg=fix_thinking, channel=channel,
+                            )
+                            if fix_sid:
+                                fix_session = fix_sid
+
+                            fix_chunks = split_message(fix_result)
+                            try:
+                                await pikmin_edit(fix_thinking, fix_chunks[0], channel)
+                            except Exception:
+                                await pikmin_send(channel, fix_chunks[0], pikmin)
+                            for chunk in fix_chunks[1:]:
+                                await pikmin_send(channel, chunk, pikmin)
+
+                            re_thinking = await pikmin_send(
+                                channel, f"🔍 Re-review 中... (第 {fix_round}/{MAX_GEN_EVAL_ROUNDS} 輪)", eval_pikmin
+                            )
+                            review = await run_evaluator(prompt, fix_result, cwd, channel=channel)
+                            if review:
+                                re_chunks = split_message(review)
+                                try:
+                                    await pikmin_edit(re_thinking, re_chunks[0], channel)
+                                except Exception:
+                                    await pikmin_send(channel, re_chunks[0], eval_pikmin)
+                                for chunk in re_chunks[1:]:
+                                    await pikmin_send(channel, chunk, eval_pikmin)
+                            else:
+                                await pikmin_edit(re_thinking, "✅ 修正後沒有發現問題。", channel)
+
+                            verdict = _parse_verdict(review)
+                            if verdict in ("PASS", "PASS_WITH_SUGGESTIONS"):
+                                break
+                        else:
+                            await channel.send(f"⚠️ 經 {MAX_GEN_EVAL_ROUNDS} 輪修正仍有問題，請人工檢查。")
+                except Exception as eval_err:
+                    print(f"[CODING] eval error: {eval_err}", flush=True)
+                    try:
+                        await pikmin_edit(eval_thinking, f"⚠️ Review 失敗: {eval_err}", channel)
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            try:
+                await channel.send("⚠️ 被中斷，請重新發送指令。")
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            print(f"[CODING] execution ERROR: {e}", flush=True)
+            try:
+                await channel.send(f"❌ Error: {e}")
+            except Exception:
+                pass
+
+
 async def generator_evaluator_loop(
     initial_prompt: str,
     cwd: str,
@@ -2939,6 +3122,87 @@ class PlanView(discord.ui.View):
         _plan_data.pop(interaction.message.id, None)
         pending_plans.pop(self.channel.id, None)
         await self.channel.send("📋 計畫已取消。")
+
+
+_coding_exec_data: dict[int, dict] = {}
+
+
+class CodingExecView(discord.ui.View):
+    """Buttons for confirming Manager's plan: Codex / Claude / Cancel."""
+
+    def __init__(self, spec="", plan_branch="", plan_base="", prompt="", cwd="",
+                 channel=None, pikmin=None, detected=""):
+        super().__init__(timeout=None)
+        self.spec = spec
+        self.plan_branch = plan_branch
+        self.plan_base = plan_base
+        self.prompt = prompt
+        self.cwd = cwd
+        self.channel = channel
+        self.pikmin = pikmin
+        self.detected = detected
+
+    def store(self, message_id: int):
+        _coding_exec_data[message_id] = {
+            "spec": self.spec, "plan_branch": self.plan_branch, "plan_base": self.plan_base,
+            "prompt": self.prompt, "cwd": self.cwd,
+            "channel_id": self.channel.id if self.channel else None,
+            "pikmin": self.pikmin, "detected": self.detected,
+        }
+
+    def _load(self, interaction: discord.Interaction) -> bool:
+        data = _coding_exec_data.get(interaction.message.id)
+        if not data:
+            return False
+        self.spec = data["spec"]
+        self.plan_branch = data["plan_branch"]
+        self.plan_base = data["plan_base"]
+        self.prompt = data["prompt"]
+        self.cwd = data["cwd"]
+        self.channel = interaction.channel
+        self.pikmin = data["pikmin"]
+        self.detected = data["detected"]
+        return True
+
+    def _disable_all(self):
+        for child in self.children:
+            child.disabled = True
+
+    @discord.ui.button(label="⚙️ Codex 執行", style=discord.ButtonStyle.success, custom_id="coding:exec_codex")
+    async def codex_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._load(interaction):
+            await interaction.response.edit_message(content=_EXPIRED_MSG, view=None)
+            return
+        self._disable_all()
+        await interaction.response.edit_message(view=self)
+        _coding_exec_data.pop(interaction.message.id, None)
+        asyncio.create_task(_run_coding_execution(
+            "codex", self.channel, self.cwd, self.spec, self.plan_branch, self.plan_base,
+            self.prompt, self.pikmin, self.detected,
+        ))
+
+    @discord.ui.button(label="🤖 Claude 執行", style=discord.ButtonStyle.primary, custom_id="coding:exec_claude")
+    async def claude_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._load(interaction):
+            await interaction.response.edit_message(content=_EXPIRED_MSG, view=None)
+            return
+        self._disable_all()
+        await interaction.response.edit_message(view=self)
+        _coding_exec_data.pop(interaction.message.id, None)
+        asyncio.create_task(_run_coding_execution(
+            "claude", self.channel, self.cwd, self.spec, self.plan_branch, self.plan_base,
+            self.prompt, self.pikmin, self.detected,
+        ))
+
+    @discord.ui.button(label="❌ 取消", style=discord.ButtonStyle.danger, custom_id="coding:cancel")
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._load(interaction):
+            await interaction.response.edit_message(content=_EXPIRED_MSG, view=None)
+            return
+        self._disable_all()
+        await interaction.response.edit_message(view=self)
+        _coding_exec_data.pop(interaction.message.id, None)
+        await self.channel.send("📋 已取消執行。")
 
 
 # ── Thread Summaries ─────────────────────────────────────────────────────────
@@ -3909,6 +4173,7 @@ async def on_ready():
     client.add_view(SuggestionView())
     client.add_view(PlanView())
     client.add_view(TodoDispatchView())
+    client.add_view(CodingExecView())
     print(f"Bot is online as {client.user}", flush=True)
     for guild in client.guilds:
         print(f"  Connected to server: {guild.name} (id: {guild.id})", flush=True)
@@ -5084,7 +5349,8 @@ async def on_message(message: discord.Message):
                         _save_state()
                     gen_result = exec_result
                 else:
-                    # Complex task: show plan first, then Codex executes
+                    # Complex task: show plan with confirmation buttons; execution
+                    # happens via button click (see CodingExecView).
                     plan_header = "📋 **Manager Plan**"
                     branch_line = ""
                     if plan_branch and plan_base:
@@ -5108,37 +5374,18 @@ async def on_message(message: discord.Message):
                         for chunk in plan_chunks[1:]:
                             await message.channel.send(chunk)
 
-                    # New status message for Codex execution
-                    if pikmin:
-                        thinking = await pikmin_send(message.channel, "⚙️ Codex 執行中...", pikmin)
-                    else:
-                        thinking = await message.channel.send("⚙️ Codex 執行中...")
-
-                    # Embed plan branch into the spec so Codex knows where to work
-                    codex_spec = spec
-                    if plan_branch:
-                        branch_instr = (
-                            f"Work on branch `{plan_branch}` (create from `{plan_base}` if it doesn't exist). "
-                            if plan_base else f"Work on branch `{plan_branch}`. "
-                        )
-                        codex_spec = branch_instr + "\n\n" + spec
-                    codex_result, codex_ok = await _run_codex_coder(codex_spec, cwd)
-                    print(f"[CODING] codex ok={codex_ok}, result_len={len(codex_result)}", flush=True)
-
-                    if not codex_ok or not codex_result:
-                        err_text = "❌ Codex 執行失敗，請稍後再試。"
-                        if pikmin:
-                            try:
-                                await pikmin_edit(thinking, err_text, message.channel)
-                            except Exception:
-                                await pikmin_send(message.channel, err_text, pikmin)
-                        else:
-                            try:
-                                await thinking.edit(content=err_text)
-                            except Exception:
-                                pass
-                        return
-                    gen_result = codex_result
+                    # Attach confirmation view as a separate message (pikmin
+                    # webhooks can't carry interactive views).
+                    view = CodingExecView(
+                        spec=spec, plan_branch=plan_branch, plan_base=plan_base,
+                        prompt=prompt, cwd=cwd, channel=message.channel,
+                        pikmin=pikmin, detected=detected or "",
+                    )
+                    confirm_msg = await message.channel.send(
+                        "選擇執行者：", view=view,
+                    )
+                    view.store(confirm_msg.id)
+                    return
 
                 executor_tag = "⚡ `Claude`" if complexity == "simple" else f"⚙️ `Codex {CODEX_CODER_MODEL}`"
                 wt_info = channel_worktrees.get(message.channel.id)
@@ -5197,7 +5444,7 @@ async def on_message(message: discord.Message):
                             fix_session = None
                             for fix_round in range(2, MAX_GEN_EVAL_ROUNDS + 1):
                                 fix_prompt = (
-                                    f"Codex 執行了以下編碼任務但 Review 不通過。\n"
+                                    f"上一個執行者跑了以下編碼任務但 Review 不通過。\n"
                                     f"原始需求：{prompt}\n\n"
                                     f"Evaluator 的回饋：\n{review}\n\n"
                                     f"請修正並說明改了什麼。"
