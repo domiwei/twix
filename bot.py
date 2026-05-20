@@ -4970,23 +4970,57 @@ async def on_message(message: discord.Message):
                 )
                 print(f"[CODING] manager output: {manager_result[:200]}", flush=True)
 
-                # Parse JSON decision; fall back to complex routing on failure
+                # Parse JSON decision; tolerate markdown fences and preamble text
+                # before the actual JSON object. Fall back to complex routing on failure.
                 complexity = "complex"
                 spec = manager_result
                 plan_branch = ""
                 plan_base = ""
-                try:
-                    raw = manager_result.strip()
-                    # Strip markdown code fences if present
+
+                def _try_extract_json(text: str):
+                    """Find the first balanced JSON object in text and return parsed dict, or None."""
+                    raw = text.strip()
                     if raw.startswith("```"):
                         raw = re.sub(r"^```[^\n]*\n?", "", raw)
                         raw = re.sub(r"\n?```$", "", raw.strip())
-                    decision = json.loads(raw)
+                    # Locate first balanced { ... } accounting for strings & escapes
+                    start = raw.find("{")
+                    while start != -1:
+                        depth = 0
+                        in_str = False
+                        esc = False
+                        for i in range(start, len(raw)):
+                            ch = raw[i]
+                            if in_str:
+                                if esc:
+                                    esc = False
+                                elif ch == "\\":
+                                    esc = True
+                                elif ch == '"':
+                                    in_str = False
+                            else:
+                                if ch == '"':
+                                    in_str = True
+                                elif ch == "{":
+                                    depth += 1
+                                elif ch == "}":
+                                    depth -= 1
+                                    if depth == 0:
+                                        candidate = raw[start:i + 1]
+                                        try:
+                                            return json.loads(candidate)
+                                        except json.JSONDecodeError:
+                                            break
+                        start = raw.find("{", start + 1)
+                    return None
+
+                decision = _try_extract_json(manager_result)
+                if decision is not None:
                     complexity = decision.get("complexity", "complex")
                     spec = decision.get("spec", manager_result)
                     plan_branch = decision.get("branch", "") or ""
                     plan_base = decision.get("base_branch", "") or ""
-                except (json.JSONDecodeError, ValueError, AttributeError):
+                else:
                     print(f"[CODING] manager JSON parse failed, defaulting to complex", flush=True)
 
                 print(f"[CODING] complexity={complexity}, branch={plan_branch!r}, base={plan_base!r}, spec_len={len(spec)}", flush=True)
