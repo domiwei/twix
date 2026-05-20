@@ -2103,17 +2103,20 @@ async def generator_evaluator_loop(
     eval_context: str = "",
     max_rounds: int = MAX_GEN_EVAL_ROUNDS,
     show_status_prefix: str = "",
+    executor: str = "claude",
 ) -> tuple[str, bool]:
     """
     Run a Generator-Evaluator dialogue loop.
     Generator produces output, Evaluator reviews. If FAIL, Evaluator's feedback
     is sent back to Generator (resuming its session) for correction.
+    executor: "claude" (default) or "codex" — which backend to use for the Generator turn.
     Returns (final_result, passed).
     """
     eval_pikmin = _pick_eval_pikmin(gen_pikmin)
     session_id = None
     result = ""
     prefix = f"{show_status_prefix} " if show_status_prefix else ""
+    exec_label = "⚙️ Codex" if executor == "codex" else "⚙️"
 
     for round_num in range(1, max_rounds + 1):
         round_label = f"(第 {round_num}/{max_rounds} 輪)" if max_rounds > 1 else ""
@@ -2121,20 +2124,32 @@ async def generator_evaluator_loop(
         # ── Generator turn ──
         if round_num == 1:
             gen_prompt = initial_prompt
-            gen_thinking = await pikmin_send(channel, f"{prefix}⚙️ 執行中... {round_label}", gen_pikmin)
+            gen_thinking = await pikmin_send(channel, f"{prefix}{exec_label} 執行中... {round_label}", gen_pikmin)
         else:
-            # Resume with evaluator feedback
-            gen_prompt = (
-                f"Evaluator 的回饋如下，請根據回饋修正：\n\n{review}\n\n"
-                f"修正完成後說明你改了什麼。"
-            )
+            # Resume with evaluator feedback (for codex, include the original task too since it has no session)
+            if executor == "codex":
+                gen_prompt = (
+                    f"{initial_prompt}\n\n---\n"
+                    f"上次嘗試的結果：\n{result}\n\n---\n"
+                    f"Evaluator 的回饋：\n{review}\n\n"
+                    f"請根據回饋修正並重新實作。"
+                )
+            else:
+                gen_prompt = (
+                    f"Evaluator 的回饋如下，請根據回饋修正：\n\n{review}\n\n"
+                    f"修正完成後說明你改了什麼。"
+                )
             gen_thinking = await pikmin_send(channel, f"{prefix}🔧 根據回饋修正中... {round_label}", gen_pikmin)
 
-        result, new_session_id, _, _, _ = await run_claude(
-            gen_prompt, cwd, session_id=session_id, status_msg=gen_thinking, channel=channel,
-        )
-        if new_session_id:
-            session_id = new_session_id
+        if executor == "codex":
+            codex_out, codex_ok = await _run_codex_coder(gen_prompt, cwd)
+            result = codex_out if codex_ok and codex_out else "(Codex 沒有輸出或執行失敗)"
+        else:
+            result, new_session_id, _, _, _ = await run_claude(
+                gen_prompt, cwd, session_id=session_id, status_msg=gen_thinking, channel=channel,
+            )
+            if new_session_id:
+                session_id = new_session_id
 
         # Show generator result
         chunks = split_message(result)
@@ -2185,7 +2200,7 @@ async def generator_evaluator_loop(
 
 
 async def execute_plan_step(step: dict, cwd: str, channel, pikmin: dict,
-                            plan_summary: str) -> tuple[str, bool]:
+                            plan_summary: str, executor: str = "claude") -> tuple[str, bool]:
     """Execute a single plan step with Generator-Evaluator dialogue."""
     initial_prompt = (
         f"## Sprint Contract 步驟 {step['id']}: {step['title']}\n\n"
@@ -2207,17 +2222,19 @@ async def execute_plan_step(step: dict, cwd: str, channel, pikmin: dict,
         gen_pikmin=pikmin,
         eval_context=eval_context,
         show_status_prefix=f"步驟 {step['id']}",
+        executor=executor,
     )
 
 
-async def execute_plan(plan: dict, cwd: str, channel, base_pikmin_idx: int):
+async def execute_plan(plan: dict, cwd: str, channel, base_pikmin_idx: int, executor: str = "claude"):
     """Execute a full sprint contract with dependency resolution."""
     steps = plan.get("steps", [])
     summary = plan.get("summary", "")
     completed: set[int] = set()
     results: dict[int, str] = {}
 
-    await channel.send(f"🚀 **開始執行 Sprint Contract** — 共 {len(steps)} 個步驟")
+    executor_label = "⚙️ Codex" if executor == "codex" else "🤖 Claude"
+    await channel.send(f"🚀 **開始執行 Sprint Contract** — 共 {len(steps)} 個步驟（執行者：{executor_label}）")
 
     while len(completed) < len(steps):
         # Find steps that are ready (all dependencies met)
@@ -2234,7 +2251,7 @@ async def execute_plan(plan: dict, cwd: str, channel, base_pikmin_idx: int):
             step = ready[0]
             pidx = (base_pikmin_idx + step["id"]) % len(PIKMIN_POOL)
             pikmin = PIKMIN_POOL[pidx]
-            result, passed = await execute_plan_step(step, cwd, channel, pikmin, summary)
+            result, passed = await execute_plan_step(step, cwd, channel, pikmin, summary, executor=executor)
             completed.add(step["id"])
             results[step["id"]] = result
             if not passed:
@@ -2246,7 +2263,7 @@ async def execute_plan(plan: dict, cwd: str, channel, base_pikmin_idx: int):
             async def _exec_step(step):
                 pidx = (base_pikmin_idx + step["id"]) % len(PIKMIN_POOL)
                 pikmin = PIKMIN_POOL[pidx]
-                return step["id"], *(await execute_plan_step(step, cwd, channel, pikmin, summary))
+                return step["id"], *(await execute_plan_step(step, cwd, channel, pikmin, summary, executor=executor))
 
             tasks = [asyncio.create_task(_exec_step(s)) for s in ready]
             for coro in asyncio.as_completed(tasks):
@@ -2870,7 +2887,7 @@ class PlanView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-    @discord.ui.button(label="✅ 開始執行", style=discord.ButtonStyle.success, custom_id="plan:start")
+    @discord.ui.button(label="🤖 Claude 執行", style=discord.ButtonStyle.success, custom_id="plan:start")
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not self._load(interaction):
             await interaction.response.edit_message(content=_EXPIRED_MSG, view=None)
@@ -2879,7 +2896,18 @@ class PlanView(discord.ui.View):
         await interaction.response.edit_message(view=self)
         _plan_data.pop(interaction.message.id, None)
         pending_plans.pop(self.channel.id, None)
-        asyncio.create_task(execute_plan(self.plan, self.cwd, self.channel, self.pikmin_idx))
+        asyncio.create_task(execute_plan(self.plan, self.cwd, self.channel, self.pikmin_idx, executor="claude"))
+
+    @discord.ui.button(label="⚙️ Codex 執行", style=discord.ButtonStyle.success, custom_id="plan:start_codex")
+    async def start_codex_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._load(interaction):
+            await interaction.response.edit_message(content=_EXPIRED_MSG, view=None)
+            return
+        self._disable_all()
+        await interaction.response.edit_message(view=self)
+        _plan_data.pop(interaction.message.id, None)
+        pending_plans.pop(self.channel.id, None)
+        asyncio.create_task(execute_plan(self.plan, self.cwd, self.channel, self.pikmin_idx, executor="codex"))
 
     @discord.ui.button(label="✏️ 修改", style=discord.ButtonStyle.primary, custom_id="plan:modify")
     async def modify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
