@@ -937,11 +937,18 @@ async def _run_claude_stream(cmd: list[str], cwd: str, status_msg=None, timeout:
 
 
 async def fetch_thread_history(channel, limit: int = 20, max_chars: int = 8000) -> str:
+    # Fetch the N most recent messages (newest-first default), then present them
+    # in chronological order. Webhook messages are sent by pikmin (bot output),
+    # so treat them as assistant role too.
+    recent = []
+    async for msg in channel.history(limit=limit):
+        recent.append(msg)
+    recent.reverse()
     messages = []
     total = 0
-    async for msg in channel.history(limit=limit, oldest_first=True):
-        role = "assistant" if msg.author == client.user else "user"
-        # Truncate long messages but keep enough context
+    for msg in recent:
+        is_bot = msg.author == client.user or msg.webhook_id is not None
+        role = "assistant" if is_bot else "user"
         text = msg.content[:1500] if role == "assistant" else msg.content
         entry = f"[{role}] {text}"
         if total + len(entry) > max_chars:
